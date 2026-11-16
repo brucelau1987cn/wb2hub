@@ -1,0 +1,16 @@
+.env
+.env.*
+!.env.example
+accounts/
+usage/
+subbridge-data/
+__pycache__/
+*.py[cod]
+.venv/
+*.log
+*.sqlite*
+*.db
+*.tar
+*.tar.gz
+dist/
+backups/

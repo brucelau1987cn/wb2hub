@@ -1,0 +1,12 @@
+.git
+.github
+.env
+.env.*
+accounts
+usage
+subbridge-data
+__pycache__
+**/__pycache__
+*.log
+*.tar*
+backups
