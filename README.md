@@ -4,6 +4,10 @@ WorkBuddy 多账号网关的**私有独立维护版**，基于原 workbuddy2api-
 
 不是原项目官方分支，不保有原 Git 历史。来源与许可见 [NOTICE.md](NOTICE.md)。默认镜像从源码构建 Go TLS helper；Linux amd64 为运行验收平台，Linux arm64 纳入交叉编译检查，未做 ARM 真机验收前不宣称完整运行支持。模型服务和福利由上游提供，部署网关不代表拥有或替代上游服务。使用前核对平台条款和账号风险。
 
+## 许可边界
+
+原有代码沿用各自许可；Buddy Switch 来源适配部分为 **PolyForm Noncommercial 1.0.0**，并非 MIT。本私有维护版按个人非商业用途维护，不应把整包视为可商用的 MIT 分发物。版权、固定来源和完整第三方许可见 [NOTICE.md](NOTICE.md) 与 [licenses/buddy-switch/LICENSE](licenses/buddy-switch/LICENSE)。
+
 ## 本地部署
 
 ```bash

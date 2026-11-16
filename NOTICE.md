@@ -12,4 +12,12 @@
 
 `tools/wb-tls-bridge/` 保存 Go 源码、模块锁定文件及第三方许可；`licenses/wb-tls-bridge/` 保留原恢复材料中的说明和第三方许可。默认 Docker 构建从 Go 源码生成 helper，不再以旧二进制作为构建必需品。`bin/wb-tls-bridge` 仍作为原 Linux amd64 保全产物留存，不能据此承诺新旧二进制逐字节一致。
 
+## Buddy Switch 个人非商业适配
+
+本轮会话识别、缓存观测和诊断日志增强参考/适配自 [NextAgentX/qoder-trae-workbuddy-switch](https://github.com/NextAgentX/qoder-trae-workbuddy-switch)，固定来源提交 `febc1b7613847268c1f8b8aa256fefd0c8bb3031`。
+
+Required Notice: Copyright (c) 2026 NextAgentX (https://github.com/NextAgentX/qoder-trae-workbuddy-switch)
+
+该来源使用 **PolyForm Noncommercial License 1.0.0**，完整原文含 Required Notice 保存在 [licenses/buddy-switch/LICENSE](licenses/buddy-switch/LICENSE)。来源适配部分仍受该非商业许可约束，不因并入本仓库而改为 MIT；原有 MIT 及其他组件的许可保持不变。本私有维护版按个人非商业用途使用；若将来分享、公开或商业使用，须重新核对适用范围并保留相应许可/通知，商业使用需取得所需授权。具体适配位置和验收边界见本轮对应的 SESSION-IDENTITY、CACHE-OBSERVATION、LOG-REDACTION 文档。
+
 仓库继续保持私有。恢复 MIT 许可来源不等于完成法律意见、改变上游服务条款或授权使用他人的账号、商标及数据；第三方组件仍须遵守各自许可。
