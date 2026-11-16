@@ -252,7 +252,7 @@ class TaskPoolScopeTests(unittest.TestCase):
             handler = self.Handler()
             with mock.patch.object(wb_proxy, "POOL", pool), \
                     mock.patch.object(wb_proxy, "growth_snapshot",
-                                      return_value=([], {})):
+                                      return_value=({'ok': True, 'tasks': [], 'errors': []}, {})):
                 handler._get_tasks({})
             self.assertEqual(handler.captured[0], 200)
             self.assertEqual([row["uid"] for row in handler.captured[1]["accounts"]],

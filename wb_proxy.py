@@ -7374,15 +7374,17 @@ def growth_snapshot(account):
     从"两条串起来等"变成一个来回，实测约 2 秒降到 1.5 秒以内。
     """
     if TASKS_CACHE_TTL <= 0:
-        from wb_tasks import fetch_growth_tasks, fetch_growth_summary
-        return _both(fetch_growth_tasks, fetch_growth_summary, account)
+        from wb_tasks import discover_growth_tasks, fetch_growth_summary
+        return _both(discover_growth_tasks, fetch_growth_summary, account)
     now = time.time()
     with _tasks_cache_lock:
         hit = _tasks_cache.get(account.uid)
         if hit and hit[0] > now:
             return hit[1]
-    from wb_tasks import fetch_growth_tasks, fetch_growth_summary
-    data = _both(fetch_growth_tasks, fetch_growth_summary, account)
+    from wb_tasks import discover_growth_tasks, fetch_growth_summary
+    data = _both(discover_growth_tasks, fetch_growth_summary, account)
+    if not data[0]["ok"]:
+        return data  # Do not cache partial/error reads as a clean empty snapshot.
     with _tasks_cache_lock:
         _tasks_cache[account.uid] = (time.time() + TASKS_CACHE_TTL, data)
     return data
@@ -22503,9 +22505,12 @@ class Handler(BaseHTTPRequestHandler):
                 acc = target
         if not acc:
             acc = cn_accounts[0]
-        tasks, summary = growth_snapshot(acc)
+        discovery, summary = growth_snapshot(acc)
+        tasks = discovery["tasks"]
         acct_list = [{"uid": a.uid, "nickname": a.nickname or a.uid[:8]} for a in cn_accounts]
         return self._json_panel(200, {
+            "ok": discovery["ok"],
+            "errors": discovery["errors"],
             "tasks": tasks,
             "summary": summary,
             "account": acc.public(),
@@ -25264,18 +25269,25 @@ class Handler(BaseHTTPRequestHandler):
             targets = [target]
         else:
             targets = POOL.task_accounts("cn")
-        targets = [a for a in targets if a is not None]
+        if restriction_hold_remaining("cn") > 0:
+            return self._json_panel(200, {"ok": False, "msg": "国内版区域风控暂停中，未执行成长任务"})
+        targets = [a for a in targets if a is not None
+                   and getattr(a, "task_active", lambda: True)()
+                   and not getattr(a, "account_banned", False)
+                   and not getattr(a, "is_enterprise", lambda: False)()]
         if not targets:
             return self._json_panel(200, {"ok": False, "msg": "未找到参与任务的国内版账号"})
         from wb_tasks import run_growth_tasks
         claim = payload.get("claim", True) is not False
         combined_logs = []
         total_credit = 0
+        all_ok = True
         for i, acc in enumerate(targets):
             uid_str = acc.uid[:8] if acc.uid else "?"
             nick = acc.nickname or uid_str
             combined_logs.append(f"====== 正在为账号 [{nick} ({acc.uid})] 执行全自动成长任务 ({i+1}/{len(targets)}) ======")
             res = run_growth_tasks(acc, gap=1.0, claim=claim)
+            all_ok = all_ok and res.get("ok") is not False
             # run_growth_tasks() reports its total as "earned_credit";
             # reading the old "credit_added" name silently summed zeros
             # and the dashboard always showed "+0 积分".
@@ -25284,10 +25296,10 @@ class Handler(BaseHTTPRequestHandler):
                 combined_logs.append(f"  {l}")
             if i < len(targets) - 1:
                 time.sleep(1.5)
-        combined_logs.append(f"====== 全部 {len(targets)} 个账号任务执行完毕，累计新增积分: +{total_credit} ======")
-        add_log_entry(f"[任务福利] 批量成长任务执行完成，共 {len(targets)} 个账号，新增积分 +{total_credit}", tag="tasks")
+        combined_logs.append(f"====== 全部 {len(targets)} 个账号任务执行完毕，奖励回执确认积分: +{total_credit} ======")
+        add_log_entry(f"[任务福利] 批量成长任务执行完成，共 {len(targets)} 个账号，奖励回执确认积分 +{total_credit}", tag="tasks")
         return self._json_panel(200, {
-            "ok": True,
+            "ok": all_ok,
             "credit_added": total_credit,
             "logs": combined_logs,
             "accounts_count": len(targets)
@@ -25363,13 +25375,28 @@ class Handler(BaseHTTPRequestHandler):
         target = POOL.get(uid)
         if not target or target.realm != "cn":
             return self._json_panel(200, {"ok": False, "msg": "未找到指定的国内版账号"})
-        from wb_tasks import claim_task
-        res = claim_task(target, code)
+        if (restriction_hold_remaining("cn") > 0
+                or not getattr(target, "task_active", lambda: True)()
+                or getattr(target, "account_banned", False)
+                or getattr(target, "is_enterprise", lambda: False)()):
+            return self._json_panel(200, {"ok": False, "msg": "任务参与或风控闸门阻止领奖"})
+        from wb_tasks import claim_task, discover_growth_tasks
+        discovery = discover_growth_tasks(target)
+        task = next((t for t in discovery["tasks"] if t["task_code"] == code), None)
+        if task is None:
+            return self._json_panel(200, {"ok": False, "state": "read_error" if discovery["errors"] else "unknown",
+                "reward_verified": False, "credit": 0,
+                "msg": "; ".join(discovery["errors"]) or "任务不在当前清单，未发起领奖"})
+        res = claim_task(target, code, mp=bool(task.get("mp")))
         invalidate_tasks_cache()
+        verified = res.get("ok") is True and res.get("reward_verified") is True
         return self._json_panel(200, {
-            "ok": bool(res.get("ok")),
-            "msg": res.get("msg") or ("领取成功" if res.get("ok") else "领取失败"),
-            "credit": res.get("credit", 0),
+            "ok": verified,
+            "state": res.get("state", "unknown"),
+            "reward_verified": verified,
+            "msg": res.get("msg") or ("奖励回执已确认" if verified else "未确认本次新增奖励"),
+            "credit": res.get("credit", 0) if verified else 0,
+            "energy": res.get("energy", 0) if verified else 0,
         })
 
     def _route_tasks_streak_bonus(self, payload):

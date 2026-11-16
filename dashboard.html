@@ -9612,8 +9612,9 @@ async function loadGrowthTasks(){
 
     const tb = document.querySelector("#growthTable tbody");
     if(!tb) return;
+    if(r.errors && r.errors.length){ toast('任务清单查询未完成: ' + r.errors.join('; '), 'warn'); }
     if(!tasks.length){
-      tb.innerHTML = '<tr><td colspan="5" class="empty">暂无任务或未登录国内版账号</td></tr>';
+      tb.innerHTML = '<tr><td colspan="5" class="empty">' + esc(r.ok === false ? ('任务清单查询失败: ' + (r.errors || []).join('; ')) : '暂无任务或未登录国内版账号') + '</td></tr>';
       return;
     }
     tb.innerHTML = tasks.map(t => {
@@ -9637,7 +9638,7 @@ async function loadGrowthTasks(){
         + '<td data-label="奖励">' + (rwd || '-') + '</td>'
         + '<td data-label="状态">' + stBadge
         + ((t.status !== 'claimed' && (t.status === 'completed' || (Number(t.current) || 0) >= (Number(t.target) || 0)))
-           ? ' <button class="sec mini" data-code="' + esc(t.task_code) + '" onclick="claimGrowthTask(this)">领取</button>' : '')
+           ? ' <button class="sec mini" data-code="' + esc(t.task_code) + '" data-mp="' + (t.mp ? '1' : '0') + '" onclick="claimGrowthTask(this)">领取</button>' : '')
         + '</td>'
         + '</tr>';
     }).join('');
@@ -9676,7 +9677,7 @@ async function runGrowthTasks(btn, uidOverride){
       toast('成长任务执行失败: ' + msg, 'bad');
       return false;
     }
-    const sumC = r.credit_added != null ? ('，共增加 +' + r.credit_added + ' 积分') : '';
+    const sumC = r.credit_added != null ? ('，奖励回执确认 +' + r.credit_added + ' 积分') : '';
     toast("成长任务流水执行完成" + sumC + "！");
     return true;
   }catch(e){
@@ -9765,6 +9766,7 @@ function saveGrowthAutoClaim(checked){
 }
 
 async function claimGrowthTask(btn){
+  // Origin is rediscovered server-side; never trust a client flag for routing.
   const code = (btn && btn.dataset && btn.dataset.code) || '';
   const uid = (CURRENT_GROWTH_UID && CURRENT_GROWTH_UID !== 'all') ? CURRENT_GROWTH_UID : '';
   if(!code) return;
@@ -9772,10 +9774,10 @@ async function claimGrowthTask(btn){
   if(btn) btn.disabled = true;
   try{
     const r = await postJSON('/tasks/claim', {uid, code});
-    if(r.ok){
-      toast('领取成功' + (r.credit ? ('，+' + r.credit + ' 积分') : ''), 'ok');
+    if(r.ok && r.reward_verified === true){
+      toast(r.msg || '奖励回执已确认', 'ok');
     } else {
-      toast('领取失败: ' + (r.msg || '未知原因'), 'bad');
+      toast(r.msg || '未确认本次新增奖励', 'warn');
     }
     await loadGrowthTasks();
     await loadAccounts();
