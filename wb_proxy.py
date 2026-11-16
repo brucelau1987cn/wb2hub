@@ -1714,6 +1714,12 @@ def _row_cache_observation(row):
         return count
     if count is not None and (count > 0 or field != ("cached_tokens",)):
         return count
+    if count == 0:
+        # Ignore the synthetic legacy top-level zero when checking raw aliases;
+        # it can precede genuine input/completion detail evidence in alias order.
+        raw = dict(row)
+        raw.pop("cached_tokens", None)
+        return _cache_observation(raw)[0]
     return None
 
 
@@ -19173,12 +19179,14 @@ def web_tools_active(body):
 
 def sum_usage(total, part):
     """Sum tool rounds; the complete request is known only if every round is."""
-    if not isinstance(part, dict):
-        return total
-    previous = _cache_observation(total)[0] if isinstance(total, dict) else 0
+    # None as the accumulator is uninitialized; None as a part is a missing
+    # included round and must leave a sticky unknown marker, even when first.
+    complete = total is None or _cache_observation(total)[0] is not None
+    previous = (_cache_observation(dict(total, cache_observed=True))[0]
+                if isinstance(total, dict) else 0)
     current = _cache_observation(part)[0]
-    out = _sum_usage_values(total, part)
-    out["cache_observed"] = previous is not None and current is not None
+    out = _sum_usage_values(total, part if isinstance(part, dict) else {})
+    out["cache_observed"] = complete and current is not None
     # Canonicalize summed aliases: different rounds may report different fields.
     for name in ("prompt_tokens_details", "input_tokens_details", "completion_tokens_details"):
         if isinstance(out.get(name), dict):

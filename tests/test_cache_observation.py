@@ -148,6 +148,33 @@ class CacheObservationTests(unittest.TestCase):
         self.assertIsNone(self.p['_finalize_analytics_stat'](unknown)['cache_hit_pct'])
         self.assertIsNone(self.p['_finalize_analytics_stat'](self.p['_new_analytics_stat']())['cache_hit_pct'])
 
+    def test_legacy_raw_detail_zero_is_known_despite_synthetic_top_zero(self):
+        for alias in ['input_tokens_details', 'completion_tokens_details']:
+            with self.subTest(alias=alias):
+                miss = {'prompt_tokens': 100, 'cached_tokens': 0,
+                        alias: {'cached_tokens': 0}}
+                self.assertEqual(self.p['_row_cache_observation'](miss), 0)
+                stat = self.p['_new_analytics_stat']()
+                series = self.p['_new_series_bucket'](0)
+                accounts = {}
+                for row in [{'prompt_tokens': 100, 'cached_tokens': 80}, miss]:
+                    self.p['_feed_analytics'](stat, self.p['_analytics_row_values'](row), False, 0)
+                    self.p['_feed_series_bucket'](series, row)
+                    self.p['_fold_usage_by_account'](row, accounts)
+                final = self.p['_finalize_analytics_stat'](stat)
+                self.assertEqual(final['cache_hit_pct'], 40.0)
+                for bucket in [final, series, accounts['(unattributed)']]:
+                    self.assertEqual(bucket['cache_observed_requests'], 2)
+                    self.assertEqual(bucket['cache_unknown_requests'], 0)
+                    self.assertEqual(bucket['cache_observed_prompt_tokens'], 200)
+                self.assertIsNone(self.p['_row_cache_observation'](dict(miss, cache_observed=False)))
+        for raw in [None, [], {}, {'cached_tokens': False}, {'cached_tokens': -1},
+                    {'cached_tokens': 'bad'}]:
+            self.assertIsNone(self.p['_row_cache_observation'](
+                {'prompt_tokens': 100, 'cached_tokens': 0, 'input_tokens_details': raw}))
+        self.assertIsNone(self.p['_row_cache_observation'](
+            {'prompt_tokens': 100, 'cached_tokens': 0, 'cache_hit_pct': 0}))
+
     def test_dashboard_dom_renders_unknown_and_zero_separately(self):
         html = (ROOT / 'dashboard.html').read_text()
         block = html.split('  // KPI 5: 缓存命中率', 1)[1].split('  // KPI 6:', 1)[0]
@@ -184,6 +211,25 @@ class CacheObservationTests(unittest.TestCase):
         self.assertEqual(fields['cached_tokens'], 80)
         total = self.p['sum_usage'](total, unknown)
         self.assertFalse(self.p['_extract_usage'](total)['cache_observed'])
+
+    def test_missing_tool_round_invalidates_cache_in_either_order(self):
+        hit = {'prompt_tokens': 100, 'completion_tokens': 5, 'total_tokens': 105,
+               'prompt_tokens_details': {'cached_tokens': 80}}
+        for parts in [(hit, None), (None, hit), (hit, None, hit), (None, None)]:
+            with self.subTest(parts=parts):
+                total: Any = None
+                for part in parts:
+                    total = self.p['sum_usage'](total, part)
+                known_rounds = sum(part is not None for part in parts)
+                self.assertIsInstance(total, dict)
+                self.assertIs(total['cache_observed'], False)
+                self.assertFalse(self.p['_extract_usage'](total)['cache_observed'])
+                self.assertEqual(total.get('prompt_tokens', 0), 100 * known_rounds)
+                self.assertEqual(total.get('completion_tokens', 0), 5 * known_rounds)
+                self.assertEqual(total.get('total_tokens', 0), 105 * known_rounds)
+                self.assertEqual(total.get('cached_tokens', 0), 80 * known_rounds)
+        initial = self.p['sum_usage'](None, hit)
+        self.assertTrue(self.p['_extract_usage'](initial)['cache_observed'])
 
     def test_anthropic_stream_preserves_cache_evidence(self):
         hit = {'prompt_tokens': 100, 'total_tokens': 101, 'cached_tokens': 80}

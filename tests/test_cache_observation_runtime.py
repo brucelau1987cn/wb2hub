@@ -10,6 +10,90 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class CacheObservationRuntimeTests(unittest.TestCase):
+    def test_missing_tool_rounds_persist_unknown_without_losing_totals(self):
+        with tempfile.TemporaryDirectory(prefix='missing-round-') as tmp:
+            env = dict(os.environ, ACCOUNTS_DIR=tmp + '/accounts',
+                       WB_PROXY_USAGE_DIR=tmp + '/usage', WB_SETTINGS_DIR=tmp,
+                       PYTHONDONTWRITEBYTECODE='1')
+            script = r'''
+import json
+import wb_proxy as p
+hit = dict(prompt_tokens=100, completion_tokens=5, total_tokens=105,
+           prompt_tokens_details={'cached_tokens': 80})
+expected = []
+for parts in [(hit, None), (None, hit), (hit, None, hit)]:
+    total = None
+    for part in parts:
+        total = p.sum_usage(total, part)
+    n = sum(part is not None for part in parts)
+    p.record_usage('test', total)
+    expected.append(n)
+with open(p.USAGE_LOG) as fh:
+    rows = [json.loads(line) for line in fh]
+assert len(rows) == 3, rows
+for row, n in zip(rows, expected):
+    assert row['cache_observed'] is False, row
+    assert row.get('cache_hit_pct') is None, row
+    assert row['prompt_tokens'] == 100 * n, row
+    assert row['completion_tokens'] == 5 * n, row
+    assert row['total_tokens'] == 105 * n, row
+stat = p.compute_usage_analytics(ttl=0)['summary']['window']
+assert stat['cache_unknown_requests'] == 3, stat
+assert stat['cache_observed_requests'] == 0, stat
+assert stat['cache_observed_prompt_tokens'] == 0, stat
+assert stat['cache_hit_pct'] is None, stat
+assert p.perf_stats(ttl=0)['cache_hit_pct'] is None
+print('missing tool rounds persisted unknown; numeric usage preserved OK')
+'''
+            result = subprocess.run([sys.executable, '-c', script], cwd=ROOT,
+                                    env=env, capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
+    def test_legacy_raw_zero_jsonl_readers_include_both_observations(self):
+        for alias in ['input_tokens_details', 'completion_tokens_details']:
+            with self.subTest(alias=alias), tempfile.TemporaryDirectory(prefix='raw-cache-zero-') as tmp:
+                env = dict(os.environ, ACCOUNTS_DIR=tmp + '/accounts',
+                           WB_PROXY_USAGE_DIR=tmp + '/usage', WB_SETTINGS_DIR=tmp,
+                           PYTHONDONTWRITEBYTECODE='1')
+                script = r'''
+import json, os, sys, time
+import wb_proxy as p
+alias = sys.argv[1]
+os.makedirs(os.path.dirname(p.USAGE_LOG), exist_ok=True)
+now = time.time()
+rows = [dict(at=now - 2, model='test', prompt_tokens=100, cached_tokens=80),
+        dict(at=now - 1, model='test', prompt_tokens=100, cached_tokens=0,
+             cache_hit_pct=0, **{alias: {'cached_tokens': 0}})]
+with open(p.USAGE_LOG, 'w') as fh:
+    for row in rows: fh.write(json.dumps(row) + '\n')
+original = open(p.USAGE_LOG, 'rb').read()
+stat = p.compute_usage_analytics(ttl=0)['summary']['window']
+assert stat['cache_hit_pct'] == 40.0, stat
+snap = p.usage_snapshot(ttl=0)
+accts = p.usage_by_account(ttl=0)
+for bucket in [stat, snap, snap['by_model']['test'], accts[0]]:
+    assert bucket['cache_observed_prompt_tokens'] == 200, bucket
+    assert bucket['cache_observed_requests'] == 2, bucket
+    assert bucket['cache_unknown_requests'] == 0, bucket
+recent = p.recent_usage()
+recent = recent['rows'] if isinstance(recent, dict) else recent
+assert len(recent) == 2, recent
+assert all(r['cache_observed'] is True for r in recent), recent
+assert sorted(r['cache_hit_pct'] for r in recent) == [0.0, 80.0], recent
+perf = p.perf_stats(ttl=0)
+assert perf['cache_hit_pct']['samples'] == 2, perf
+assert perf['cache_hit_pct']['avg'] == 40.0, perf
+series = p.usage_timeseries(range='custom', since=now - 100, until=now + 1,
+                            bucket_seconds=60, ttl=0)
+assert sum(b['cache_observed_prompt_tokens'] for b in series['series']) == 200, series
+assert sum(b['cache_observed_requests'] for b in series['series']) == 2, series
+assert open(p.USAGE_LOG, 'rb').read() == original
+print('legacy raw zero JSONL readers: rate=40 denominator=200 observed=2 perf=2 OK')
+'''
+                result = subprocess.run([sys.executable, '-c', script, alias], cwd=ROOT,
+                                        env=env, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_real_readers_legacy_rows_and_checkpoint_roundtrip(self):
         with tempfile.TemporaryDirectory(prefix='cache-observation-') as tmp:
             env = dict(os.environ, ACCOUNTS_DIR=tmp + '/accounts',
