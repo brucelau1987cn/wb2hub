@@ -144,6 +144,8 @@ class Scheduler:
         wb_tasks.set_logger(self.log)
 
     def log(self, msg, tag=None):
+        from wb_diagnostics import diagnostic_detail
+        msg = diagnostic_detail(msg)
         ts = time.strftime("%Y-%m-%d %H:%M:%S")
         entry = f"[{ts}] {msg}"
         with self._log_lock:

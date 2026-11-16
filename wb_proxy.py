@@ -1930,7 +1930,9 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     key's model whitelist still land on the right row instead of vanishing
     into the unattributed bucket.
     """
+    from wb_diagnostics import diagnostic_detail
     fields = _extract_usage(usage) or {}
+    safe_message = diagnostic_detail(message)
     row = {
         "at": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1938,7 +1940,7 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
         "error": True,
         "outcome": outcome,
         "status": status,
-        "message": str(message)[:200],
+        "message": safe_message,
         "elapsed_ms": elapsed_ms,
     }
     if stream is not None:
@@ -1971,7 +1973,7 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     acc_tag = f" acct={account[:8]}" if account else ""
     egress_tag = (f" slot={proxy_slot} egress={proxy_exit}"
                   if proxy_slot or proxy_exit else "")
-    log(f"request error: model={model}{dur}{acc_tag}{egress_tag} status={status} outcome={outcome} msg={str(message)[:180]}",
+    log(f"request error: model={model}{dur}{acc_tag}{egress_tag} status={status} outcome={outcome} msg={safe_message}",
         level="ERROR", tag="chat")
     return row
 def _pct(values, q):
@@ -12256,7 +12258,8 @@ def add_log_entry(msg, level=None, tag=None):
             tag = "system"
     # 掩码必须发生在 level/tag 推断**之后**：推断用的是原始串（见上），若先掩码，
     # 含手机号的日志行其分类会被改变，属行为回归。buffer 里只存掩码后的文本。
-    safe_msg = _mask_text(msg_str)
+    from wb_diagnostics import diagnostic_detail
+    safe_msg = diagnostic_detail(_mask_text(msg_str))
     with _LOG_LOCK:
         _LOG_COUNTER += 1
         entry = {
@@ -12387,7 +12390,8 @@ def log(msg, level=None, tag=None):
         add_log_entry(msg, level=level, tag=tag)
         return
     _ensure_log_writer()
-    line = f"[wb-proxy] {time.strftime('%H:%M:%S')} {_mask_text(str(msg))}\n"
+    from wb_diagnostics import diagnostic_detail
+    line = f"[wb-proxy] {time.strftime('%H:%M:%S')} {diagnostic_detail(_mask_text(str(msg)))}\n"
     try:
         _LOG_QUEUE.put_nowait(line)
     except queue.Full:
@@ -12405,6 +12409,12 @@ wb_webtools.set_logger(log)
 wb_upstream_pool.set_tls_logger(log)
 
 def get_logs(limit=200, level="", tag="", search="", since_id=0):
+    from wb_diagnostics import diagnostic_detail
+
+    def safe_entry(item):
+        return {key: (diagnostic_detail(_mask_text(value)) if isinstance(value, str) else value)
+                for key, value in item.items()
+                if key in {"id", "ts", "time", "level", "tag", "msg"}}
     # 落库开启时以数据库为准：它是完整历史（受保留上限约束），而内存环形缓冲
     # 只留最新 2000 条，拿它回答会看不到刚过去的窗口。查询失败或超时就退回内存，
     # 面板宁可少看历史，也不能因为日志库出问题而整页空白。
@@ -12415,7 +12425,7 @@ def get_logs(limit=200, level="", tag="", search="", since_id=0):
         except Exception:
             stored = None
         if stored is not None:
-            return stored
+            return {**stored, "logs": [safe_entry(item) for item in stored["logs"]]}
     with _LOG_LOCK:
         items = list(LOG_BUFFER)
     if since_id > 0:
@@ -12431,7 +12441,7 @@ def get_logs(limit=200, level="", tag="", search="", since_id=0):
     if limit and limit > 0 and since_id == 0:
         items = items[-limit:]
     max_id = items[-1]["id"] if items else since_id
-    return {"total": total, "logs": items, "max_id": max_id}
+    return {"total": total, "logs": [safe_entry(item) for item in items], "max_id": max_id}
 
 def clear_logs():
     with _LOG_LOCK:
@@ -16767,7 +16777,8 @@ def exc_detail(exc, limit=180):
     text = (text or "").strip()
     if not text:
         return type(exc).__name__
-    return ("%s: %s" % (type(exc).__name__, text))[:limit]
+    from wb_diagnostics import diagnostic_detail
+    return diagnostic_detail("%s: %s" % (type(exc).__name__, text), limit=limit)
 
 # The shapes the upstream uses for a rate limit. A body naming one is a soft
 # limit; it still says nothing about scope, so the caller decides that from the
@@ -21355,7 +21366,10 @@ class Handler(BaseHTTPRequestHandler):
                     return
         except Exception:
             pass
-        log(fmt % args)
+        # Only method, path (no query), version and status are access metadata.
+        text = fmt % args
+        text = re.sub(r'([A-Z]+ [^ ?\r\n]+)\?[^ \r\n]*', r'\1', text)
+        log(text)
     def _json(self, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         self.send_response(code)
@@ -26437,19 +26451,19 @@ class Handler(BaseHTTPRequestHandler):
                 allow_realm_fallback=not explicit_realm,
                 **key_open_kwargs(getattr(self, "key_entry", None)))
         except PinnedAccountError as exc:
-            record_error(model, exc.status, exc.message[:200],
+            record_error(model, exc.status, exc.message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=exc.account_uid, key=self._key_id())
             return self._error(exc.status, exc.message, "invalid_request_error")
         except ContentRejected as exc:
-            record_error(model, 403, exc.detail[:200],
+            record_error(model, 403, exc.detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
             return self._error(403, "upstream 403: %s" % (exc.detail or "content rejected"),
                                "invalid_request_error")
         except LocalNetworkError as exc:
-            record_error(model, 503, exc.detail[:200],
+            record_error(model, 503, exc.detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
@@ -26457,13 +26471,13 @@ class Handler(BaseHTTPRequestHandler):
                                     "（本次不计入账号熔断）" % (exc.detail or "DNS/路由失败"),
                                "invalid_request_error")
         except wb_accounts.TLSVerifyError as exc:
-            record_error(model, 502, str(exc)[:200],
+            record_error(model, 502, str(exc),
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          key=self._key_id())
             return self._error(502, str(exc), "invalid_request_error")
         except RateLimited as exc:
             t = time.time() - t_start
-            record_error(model, 429, exc.detail[:200], elapsed_ms=int(t * 1000),
+            record_error(model, 429, exc.detail, elapsed_ms=int(t * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
             return self._rate_limited(exc)
@@ -26793,12 +26807,12 @@ class Handler(BaseHTTPRequestHandler):
                 allow_realm_fallback=not explicit_realm,
                 **key_open_kwargs(getattr(self, "key_entry", None)))
         except PinnedAccountError as exc:
-            record_error(model, exc.status, exc.message[:200],
+            record_error(model, exc.status, exc.message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=exc.account_uid, key=self._key_id())
             return self._anthropic_error(exc.status, exc.message)
         except ContentRejected as exc:
-            record_error(model, 403, exc.detail[:200],
+            record_error(model, 403, exc.detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
@@ -26806,7 +26820,7 @@ class Handler(BaseHTTPRequestHandler):
                                           (exc.detail or "content rejected"),
                                           "permission_error")
         except LocalNetworkError as exc:
-            record_error(model, 503, exc.detail[:200],
+            record_error(model, 503, exc.detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
@@ -26815,12 +26829,12 @@ class Handler(BaseHTTPRequestHandler):
                                               % (exc.detail or "DNS/路由失败"),
                                          "api_error")
         except wb_accounts.TLSVerifyError as exc:
-            record_error(model, 502, str(exc)[:200],
+            record_error(model, 502, str(exc),
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          key=self._key_id())
             return self._anthropic_error(502, str(exc), "api_error")
         except RateLimited as exc:
-            record_error(model, 429, exc.detail[:200],
+            record_error(model, 429, exc.detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
@@ -27265,19 +27279,19 @@ class Handler(BaseHTTPRequestHandler):
                 prebuilt_body=forwarded, defer_egress_success=True,
                 **key_open_kwargs(getattr(self, "key_entry", None)))
         except PinnedAccountError as exc:
-            record_error(model, exc.status, exc.message[:200],
+            record_error(model, exc.status, exc.message,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=exc.account_uid, key=self._key_id())
             return self._error(exc.status, exc.message, "invalid_request_error")
         except ContentRejected as exc:
-            record_error(model, 403, exc.detail[:200],
+            record_error(model, 403, exc.detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
             return self._error(403, "upstream 403: %s" % (exc.detail or "content rejected"),
                                "invalid_request_error")
         except LocalNetworkError as exc:
-            record_error(model, 503, exc.detail[:200],
+            record_error(model, 503, exc.detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
@@ -27285,12 +27299,12 @@ class Handler(BaseHTTPRequestHandler):
                                     "（本次不计入账号熔断）" % (exc.detail or "DNS/路由失败"),
                                "invalid_request_error")
         except wb_accounts.TLSVerifyError as exc:
-            record_error(model, 502, str(exc)[:200],
+            record_error(model, 502, str(exc),
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          key=self._key_id())
             return self._error(502, str(exc), "invalid_request_error")
         except RateLimited as exc:
-            record_error(model, 429, exc.detail[:200],
+            record_error(model, 429, exc.detail,
                          elapsed_ms=int((time.time() - t_start) * 1000),
                          account=getattr(exc, "account_uid", None),
                          key=self._key_id())
@@ -27355,7 +27369,7 @@ class Handler(BaseHTTPRequestHandler):
             status, err_type = 429, "rate_limit_error"
         else:
             status = 502
-        record_error(model, status, str(exc)[:200], elapsed_ms=elapsed,
+        record_error(model, status, str(exc), elapsed_ms=elapsed,
                      realm=realm, key=self._key_id())
         return self._error(status, str(exc), err_type)
 
@@ -27415,7 +27429,7 @@ class Handler(BaseHTTPRequestHandler):
             status, etype = 429, "rate_limit_error"
         else:
             status, etype = 502, "api_error"
-        record_error(model, status, str(exc)[:200],
+        record_error(model, status, str(exc),
                      elapsed_ms=int((time.time() - t_start) * 1000),
                      realm=realm, key=self._key_id())
         return self._anthropic_error(status, str(exc), etype)

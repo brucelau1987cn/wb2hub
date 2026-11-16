@@ -126,7 +126,8 @@ _REDACTED = "[redacted]"
 
 def safe_message(text):
     """把上游原文压成一行安全的短说明。"""
-    line = " ".join(str(text or "").split())
+    from wb_diagnostics import diagnostic_detail
+    line = " ".join(diagnostic_detail(text).split())
     for pattern in _SECRET_PATTERNS:
         line = pattern.sub(_REDACTED, line)
     return line[:MAX_MESSAGE]
