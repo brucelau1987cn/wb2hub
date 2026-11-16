@@ -73,6 +73,7 @@ import wb_activity
 import wb_atrest
 import wb_catalog
 import wb_codearts
+import wb_session
 import wb_egress
 import wb_ipintel
 import wb_logstore
@@ -17235,6 +17236,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
     # 复用同一个 X-Conversation-Request-ID / X-Root-Request-ID，只有 message id
     # 每请求新生成（见 wb_identity.new_turn_request_id）。生成在重试循环外，
     # 循环里只把它传给身份构造；桌面端 / VSCode 分支不消费它，行为不变。
+    routing_key = wb_session.routing_key(session_key, realm)
     turn_request_id = wb_identity.new_turn_request_id()
     # Only pass `allowed` when the request actually carries a restriction: a
     # stub pool in tests (and any external pool implementation) keeps its old
@@ -17341,7 +17343,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         nonlocal busy
         while True:
             exclude = tried | busy
-            kwargs = dict(realm=realm, session_key=session_key,
+            kwargs = dict(realm=realm, session_key=routing_key,
                           exclude=exclude, model=model, page=affinity_page)
             if allowed_accounts is not None:
                 kwargs["allowed"] = allowed_accounts
@@ -17407,7 +17409,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
         if account is None:
             break
         if account.realm != realm:
-            if session_key and POOL: POOL.affinity.demote(session_key, account.uid)
+            if session_key and POOL: POOL.affinity.demote(routing_key, account.uid)
             account_slot_release(account)
             continue
         tried.add(account.uid)
@@ -17527,7 +17529,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                         % (account.uid[:8], credential_scope_phrase(detail), wait,
                            account.soft_streak))
                     if session_key and POOL:
-                        POOL.affinity.demote(session_key, account.uid)
+                        POOL.affinity.demote(routing_key, account.uid)
                     last_error = exc
                     last_429 = exc
                     last_429_detail = detail
@@ -17591,12 +17593,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     except Exception:
                         pass
                     if session_key and POOL:
-                        POOL.affinity.demote(session_key, account.uid)
+                        POOL.affinity.demote(routing_key, account.uid)
                     continue
                 log("account %s throttled on '%s' (429), retry in %ds"
                     % (account.uid[:8], model, int(wait)))
                 if session_key and POOL:
-                    POOL.affinity.demote(session_key, account.uid)
+                    POOL.affinity.demote(routing_key, account.uid)
                 last_error = exc
                 last_429 = exc
                 last_429_detail = detail
@@ -17618,7 +17620,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                         "disabled until manually re-enabled (persisted)"
                         % account.uid[:8])
                     if session_key and POOL:
-                        POOL.affinity.demote(session_key, account.uid)
+                        POOL.affinity.demote(routing_key, account.uid)
                     last_error = exc
                     last_403_detail = detail
                     note_account_restriction(realm, account.uid)
@@ -17645,7 +17647,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     continue
                 log("upstream 403 for '%s' (content review), passing through" % model)
                 if session_key and POOL:
-                    POOL.affinity.demote(session_key, account.uid)
+                    POOL.affinity.demote(routing_key, account.uid)
                 last_error = exc
                 last_403_detail = detail
                 break
@@ -17658,12 +17660,12 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 log("account %s out of credits (402), parked until 04:00"
                     % account.uid[:8])
                 if session_key and POOL:
-                    POOL.affinity.demote(session_key, account.uid)
+                    POOL.affinity.demote(routing_key, account.uid)
                 last_error = exc
                 continue
             if exc.code == 401:
                 if session_key and POOL:
-                    POOL.affinity.demote(session_key, account.uid)
+                    POOL.affinity.demote(routing_key, account.uid)
                 if account.uid not in refreshed:
                     refreshed.add(account.uid)
                     try:
@@ -17727,7 +17729,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     log("upstream %s for '%s', backing off the egress %.1fs"
                         % (exc.code, model, wait))
                     if session_key and POOL:
-                        POOL.affinity.demote(session_key, account.uid)
+                        POOL.affinity.demote(routing_key, account.uid)
                     last_error = exc
                     time.sleep(min(wait, EGRESS_SLEEP_MAX))
                     continue
@@ -17736,7 +17738,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                     % (exc.code, model, code if code is not None else "-",
                        account.fails))
                 if session_key and POOL:
-                    POOL.affinity.demote(session_key, account.uid)
+                    POOL.affinity.demote(routing_key, account.uid)
                 last_error = exc
                 continue
             # Same leak as the 400 branch above: an unhandled status (e.g. 404
@@ -17753,7 +17755,7 @@ def open_upstream(payload, session_key=None, target_realm=None, prebuilt_body=No
                 last_error = exc
                 break
             if session_key and POOL:
-                POOL.affinity.demote(session_key, account.uid)
+                POOL.affinity.demote(routing_key, account.uid)
             if looks_like_local_network(exc):
                 # 本机没网：不记账。账号没发出去一个字节，这笔不该算它的；
                 # 断网期间每次都记的话，网络一恢复池子里全是冷却中的账号。
@@ -18277,18 +18279,29 @@ def probe_account(account, model=None, timeout=30):
         return row
 
 def extract_session_key(headers, payload):
-    key = (
-        headers.get("X-Conversation-Id") or
-        headers.get("Conversation-Id") or
-        headers.get("X-Session-Id") or
-        headers.get("Session-Id") or
-        payload.get("conversation_id") or
-        payload.get("session_id") or
-        (payload.get("metadata") or {}).get("conversation_id")
-    )
-    if key:
-        return str(key).strip()
-    return None
+    # Keep the existing header/body order; new spellings are additive fallbacks.
+    # Adapted from NextAgentX session_headers.rs (PolyForm Noncommercial 1.0.0).
+    # See docs/SESSION-IDENTITY.md for attribution and licensing scope.
+    def valid(value):
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value or any(ord(c) < 32 or ord(c) == 127 for c in value):
+            return None
+        return value
+
+    headers = {k.lower(): v for k, v in headers.items() if isinstance(k, str)}
+    payload = payload if isinstance(payload, dict) else {}
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    candidates = [headers.get(name) for name in (
+        "x-conversation-id", "conversation-id", "x-session-id", "session-id")]
+    candidates.extend((payload.get("conversation_id"), payload.get("session_id"),
+                       metadata.get("conversation_id")))
+    candidates.extend((headers.get("x-claude-code-session-id"),
+                       metadata.get("conversationId"), metadata.get("session_id"),
+                       metadata.get("sessionId")))
+    return next((key for value in candidates if (key := valid(value))), None)
 
 # CJK 计数走单遍 C 扫描：先 sub 掉 CJK 再按长度差计数，与原来的逐字符 Python
 # 循环逐值相等（64KB ASCII 实测 18.7ms -> 1.25ms）。别换 findall，实测更慢。
@@ -26643,7 +26656,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._anthropic_error(400, str(exc), "invalid_request_error")
         model = chat_req.get("model") or "unknown"
         want_stream = bool(chat_req.get("stream"))
-        session_key = extract_session_key(self.headers, chat_req)
+        session_key = extract_session_key(self.headers, payload)
         t_start = time.time()
         fp = prompt_fingerprint(chat_req.get("messages"))
         try:
@@ -27055,6 +27068,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._error(429, message, "rate_limit_error",
                                reset_at=reset_at)
 
+        session_scope = wb_session.enter(self.key_entry)
         try:
             if is_messages_route:
                 if path.endswith("/count_tokens"):
@@ -27080,6 +27094,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 _chat_slots.release()
         finally:
+            wb_session.leave(session_scope)
             _release_key_slot(self.key_entry)
 
     def _dispatch_chat_post(self, path, payload):
