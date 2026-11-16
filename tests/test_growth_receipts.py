@@ -57,6 +57,49 @@ def receipt(*codes):
         {'task_code': c, 'status': 'accepted'} for c in codes]}})
 
 
+class FinalTerminalBoundaryTests(unittest.TestCase):
+    def test_long_http_business_body_stops_next_chunk(self):
+        for length in (600, 5000, 70000):
+            ns = load_tasks()
+            body = json.dumps({'code': 11140, 'msg': 'x' * length}).encode()
+            ns['_accounts'].urlopen.side_effect = [urllib.error.HTTPError(
+                'https://offline.invalid', 400, 'business restriction', {}, io.BytesIO(body)), receipt('b')]
+            result = ns['accept_tasks'](account(), ['a', 'b'], chunk=1)
+            self.assertTrue(result['terminal'])
+            self.assertEqual(ns['_accounts'].urlopen.call_count, 1)
+
+    def test_manual_claim_blocks_partial_terminal_discovery(self):
+        import sys
+        from unittest.mock import patch
+        ns = load_tasks()
+        ns['_accounts'].urlopen.side_effect = [urllib.error.HTTPError(
+            'https://offline.invalid', 429, 'limited', {}, io.BytesIO(b'{}')),
+            response({'code': 0, 'data': {'tasks': [
+                {'task_code': 'Library_read', 'accept_status': 'completed'}]}})]
+        claim = Mock(return_value={'ok': True, 'reward_verified': True, 'credit': 7})
+        module = SimpleNamespace(discover_growth_tasks=ns['discover_growth_tasks'], claim_task=claim)
+        route = proxy_code(dict(POOL=SimpleNamespace(get=lambda _: account()),
+            restriction_hold_remaining=lambda _: 0, invalidate_tasks_cache=Mock()))
+        with patch.dict(sys.modules, {'wb_tasks': module}):
+            result = route['_route_tasks_claim'](SimpleNamespace(_json_panel=lambda status, data: data),
+                {'uid': 'offline', 'code': 'Library_read'})
+        self.assertFalse(result['ok'])
+        self.assertTrue(result['terminal'])
+        claim.assert_not_called()
+
+    def test_night_terminal_report_stops_progress_and_claim(self):
+        ns = load_tasks()
+        failure = ns['_growth_failure']('rate limit', code=429)
+        ns.update(fetch_growth_tasks=Mock(return_value=[task('black_cat', 'accepted')]),
+            report_events=Mock(return_value=ns['_GrowthProgressFailure'](failure)),
+            build_event=Mock(return_value={}), claim_task=Mock())
+        result = ns['run_night_growth'](account())
+        self.assertFalse(result['ok'])
+        self.assertTrue(result['terminal'])
+        self.assertEqual(ns['fetch_growth_tasks'].call_count, 1)
+        ns['claim_task'].assert_not_called()
+
+
 class AcceptanceTests(unittest.TestCase):
     def setUp(self):
         self.ns = load_tasks()

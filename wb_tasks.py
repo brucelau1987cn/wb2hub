@@ -183,7 +183,9 @@ def _growth_failure(message, code=None, cause=None, body=None, terminal=False):
     if isinstance(cause, urllib.error.HTTPError):
         if body is None:
             try:
-                body = cause.read(4096).decode("utf-8", "replace")
+                body = cause.read(65537).decode("utf-8", "replace")
+                if len(body.encode("utf-8")) > 65536:
+                    terminal = True  # Oversized evidence cannot authorize more writes.
             except Exception:
                 body = ""
         if body:
@@ -364,7 +366,7 @@ def accept_tasks(account, codes, chunk=20, mp=False):
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
-                detail = exc.read(300).decode("utf-8", "replace")
+                detail = exc.read(65537).decode("utf-8", "replace")
             except Exception:
                 pass
             out["ok"] = False
@@ -372,7 +374,8 @@ def accept_tasks(account, codes, chunk=20, mp=False):
             out["failed"].extend(part)
             out["reasons"].append(out["msg"])
             _log(f"accept batch failed: {out['msg']}")
-            if _growth_failure(str(exc), cause=exc, body=detail).terminal:
+            if _growth_failure(str(exc), cause=exc, body=detail,
+                               terminal=len(detail.encode("utf-8")) > 65536).terminal:
                 out["terminal"] = True
                 out["failed"].extend(codes[i + max(1, chunk):])
                 break
@@ -1375,6 +1378,9 @@ def run_night_growth(account):
                 "earned_credit": cr, "logs": logs}
     ev = build_event(account, "cat", idx=0)
     ok = report_events(account, [ev])
+    if getattr(ok, "terminal", False):
+        logs.append(f"[{name}] 夜间上报遇限制，已停止: {getattr(ok, 'error', 'terminal error')}")
+        return {"ok": False, "terminal": True, "earned_credit": 0, "logs": logs}
     logs.append(f"[{name}] 上报夜间 GLM-5.2 对话事件: {'成功' if ok else '失败'} (进度 {cur}/{tgt})")
     fresh = None
     for _ in range(4):

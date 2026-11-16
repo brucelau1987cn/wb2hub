@@ -25382,6 +25382,10 @@ class Handler(BaseHTTPRequestHandler):
             return self._json_panel(200, {"ok": False, "msg": "任务参与或风控闸门阻止领奖"})
         from wb_tasks import claim_task, discover_growth_tasks
         discovery = discover_growth_tasks(target)
+        if discovery.get("terminal"):
+            return self._json_panel(200, {"ok": False, "terminal": True,
+                "state": "read_error", "reward_verified": False, "credit": 0,
+                "msg": "; ".join(discovery["errors"]) or "任务查询被限制，未发起领奖"})
         task = next((t for t in discovery["tasks"] if t["task_code"] == code), None)
         if task is None:
             return self._json_panel(200, {"ok": False, "state": "read_error" if discovery["errors"] else "unknown",
