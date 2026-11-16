@@ -14,6 +14,21 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+### Compose 文件入口
+
+仓库同时提供 [`compose.yml`](compose.yml) 和 [`docker-compose.yml`](docker-compose.yml)，内容保持一致，CI 自动检查两者一致性及 Compose 配置有效性。`docker compose` 默认优先读取 `compose.yml`；喜欢上游文件名时可明确使用：
+
+```bash
+# 先按上文复制 .env.example 为 .env，并填写 API_KEY
+docker compose -f docker-compose.yml up -d --build
+docker compose -f docker-compose.yml ps
+docker compose -f docker-compose.yml logs --tail=100
+```
+
+两种入口都**从本仓库源码构建维护版**，不是拉取上游原版镜像；账号、用量与 subbridge 数据均保存在当前项目目录。源码更新后重新执行 `up -d --build`，不要用上游的 `docker compose pull` 代替构建，也不启用 Watchtower 自动覆盖维护版。
+
+**这两份是新部署模板，不是已有生产目录的替换文件。** 已有实例应保留原容器名、端口、数据路径和凭据，备份并核对差异后再升级；不要在现有生产容器旁直接启动第二份。只复制 YAML 文件不能构建镜像，需要完整仓库和 `.env`。
+
 默认仅绑定 loopback。浏览器通过本机 `http://127.0.0.1:7863/` 或安全隧道访问，模型 base URL 为 `http://127.0.0.1:7863/v1`。首次使用立即设置强面板密码；API key 与面板密码是不同的访问控制，不把 key 放进分享链接。需要远程使用时先配置 HTTPS 和访问控制，不直接暴露管理面板。
 
 账号通过面板添加，持久数据保存在 `accounts/`、`usage/`、`subbridge-data/`，均已忽略。**不要把这些目录、.env、备份或日志提交到 GitHub。**
