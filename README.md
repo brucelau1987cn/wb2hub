@@ -34,9 +34,12 @@ docker compose up -d --build
 # 每一步测试都在无账号容器中运行，不挂生产目录。
 docker build -t wb2hub:ci .
 docker build -f Dockerfile.tests -t wb2hub:tests .
-mkdir -p test-results/tmp
-docker run --rm --network none -v "$PWD/test-results:/results" wb2hub:tests python -m unittest discover -s tests -v
-docker run --rm --network none -v "$PWD/test-results:/results" wb2hub:tests python scripts/run_upstream_tests.py --logs /results/upstream
+mkdir -p test-results/tmp test-results/upstream
+# 与 CI 一致：仅放宽这两个无账号临时输出目录，供丢弃 capabilities 的 root 容器写入。
+# 仅用于独立临时测试环境，不要对项目、账号或其他宿主目录 chmod。
+chmod 0777 test-results/tmp test-results/upstream
+docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges -v "$PWD/test-results:/results" wb2hub:tests python -m unittest discover -s tests -v
+docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges -v "$PWD/test-results:/results" wb2hub:tests python scripts/run_upstream_tests.py --logs /results/upstream
 ```
 
 完整上游测试已归档，但默认仅运行审查过的安全基线，不声称上游全部套件已通过。测试范围、保留的旧行为冲突以及两条测试入口见 [docs/UPSTREAM-TESTS.md](docs/UPSTREAM-TESTS.md)。

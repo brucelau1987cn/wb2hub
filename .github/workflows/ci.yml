@@ -24,7 +24,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p test-results/tmp
+          mkdir -p test-results/tmp test-results/upstream
+          # Only disposable output directories on this isolated runner are shared-writable:
+          # container root with all capabilities dropped cannot bypass host UID permissions.
+          chmod 0777 test-results/tmp test-results/upstream
           docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 2g --cpus 2 -v "$PWD/test-results:/results" wb2hub:tests python -m unittest discover -s tests -v 2>&1 | tee test-results/maintenance.log
       - name: Audited upstream baseline without external network
         run: docker run --rm --network none --cap-drop ALL --security-opt no-new-privileges --pids-limit 256 --memory 2g --cpus 2 -v "$PWD/test-results:/results" wb2hub:tests python scripts/run_upstream_tests.py --logs /results/upstream
