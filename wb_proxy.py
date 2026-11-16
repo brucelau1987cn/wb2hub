@@ -1420,7 +1420,7 @@ def key_label(key_id):
 
 
 def _empty_stats():
-    return {"requests": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0,
+    return {**_cache_stats(), "requests": 0, "errors": 0, "prompt_tokens": 0, "completion_tokens": 0,
             "reasoning_tokens": 0, "cached_tokens": 0, "total_tokens": 0,
             "credit": 0.0, "cost_cny": 0.0, "cost_missing": {},
             "started": time.time(), "by_model": {},
@@ -1454,7 +1454,8 @@ def normalize_usage_cache_aliases(usage):
     usage["cache_read_input_tokens"] = best
     usage["cached_tokens"] = best
     usage["prompt_cache_hit_tokens"] = best
-    prompt_details = dict(usage.get("prompt_tokens_details") or {})
+    prompt_details = usage.get("prompt_tokens_details")
+    prompt_details = dict(prompt_details) if isinstance(prompt_details, dict) else {}
     prompt_details["cached_tokens"] = best
     usage["prompt_tokens_details"] = prompt_details
     # Also ensure input_tokens_details carries it when present
@@ -1472,14 +1473,16 @@ def normalize_usage_cache_aliases(usage):
 
 def _extract_usage(usage):
     """Normalize the upstream usage block into the fields we track."""
-    if not usage:
+    if not isinstance(usage, dict) or not usage:
         return {}
-    details = usage.get("completion_tokens_details") or {}
+    details = usage.get("completion_tokens_details")
+    details = details if isinstance(details, dict) else {}
     return {
         "prompt_tokens": usage.get("prompt_tokens") or 0,
         "completion_tokens": usage.get("completion_tokens") or 0,
         "reasoning_tokens": details.get("reasoning_tokens") or 0,
         "cached_tokens": _best_cached_tokens(usage),
+        "cache_observed": _cache_observation(usage)[0] is not None,
         "total_tokens": usage.get("total_tokens") or 0,
         "credit": usage.get("credit") or 0,
     }
@@ -1625,34 +1628,111 @@ def row_outcome(row):
     if o:
         return o
     return "failed" if row.get("error") else "completed"
-def _best_cached_tokens(usage):
-    """Best cache-hit value across every alias the upstreams emit (E3).
-
-    Order mirrors the panel: prompt_tokens_details.cached_tokens >
-    prompt_cache_hit_tokens > cache_read_input_tokens > cached_tokens >
-    input_tokens_details.cached_tokens > completion_tokens_details.
-    First positive value wins; zero aliases never shadow a real hit.
-    """
-    if not isinstance(usage, dict):
-        return 0
-    prompt_details = usage.get("prompt_tokens_details") or {}
-    input_details = usage.get("input_tokens_details") or {}
-    details = usage.get("completion_tokens_details") or {}
-    for value in (prompt_details.get("cached_tokens"),
-                  usage.get("prompt_cache_hit_tokens"),
-                  usage.get("cache_read_input_tokens"),
-                  usage.get("cached_tokens"),
-                  input_details.get("cached_tokens"),
-                  details.get("cached_tokens")):
+def _cache_observation(usage):
+    """Return (optional count, authoritative alias); missing is not a miss."""
+    if not isinstance(usage, dict) or usage.get("cache_observed") is False:
+        return None, None
+    zero = None
+    for path in (("prompt_tokens_details", "cached_tokens"),
+                 ("prompt_cache_hit_tokens",), ("cache_read_input_tokens",),
+                 ("cached_tokens",), ("input_tokens_details", "cached_tokens"),
+                 ("completion_tokens_details", "cached_tokens")):
+        value = usage
+        for key in path:
+            value = value.get(key) if isinstance(value, dict) else None
         try:
-            number = float(value or 0)
-        except (TypeError, ValueError):
+            if value is None or isinstance(value, bool):
+                continue
+            number = float(value)
+            if not (0 <= number < float("inf")):
+                continue
+            count = int(number)
+        except (TypeError, ValueError, OverflowError):
             continue
-        if number > 0:
-            # Token counts must stay integers: the Codex client parses
-            # response.completed strictly and rejects 123.0 (invalid number).
-            return int(number)
-    return 0
+        if count > 0:
+            return count, path
+        if zero is None:
+            zero = path
+    return (0, zero) if zero is not None else (None, None)
+
+
+def _best_cached_tokens(usage):
+    """Numeric compatibility view; observation status is tracked separately."""
+    return _cache_observation(usage)[0] or 0
+
+
+def _merge_usage_frame(previous, current):
+    """Merge cumulative frames, carrying missing cache, not stale alias hits.
+
+    A compatibility zero on a different alias cannot erase an earlier hit.
+    A zero on the authoritative field can, even on a cache-only final frame.
+    """
+    if not isinstance(current, dict):
+        return previous
+    previous = previous if isinstance(previous, dict) else {}
+    old, source = _cache_observation(previous)
+    count, field = _cache_observation(current)
+    if old is not None and source is not None and count == 0 and field != source:
+        value = current
+        for key in source:
+            value = value.get(key) if isinstance(value, dict) else None
+        same, _ = _cache_observation({"cached_tokens": value})
+        if same == 0:
+            field = source
+        else:
+            count, field = old, source
+    if count is None:
+        count, field = old, source
+    # Keep the existing cumulative-token rule, independently of cache frames.
+    out = dict(current if (current.get("total_tokens") or 0) >=
+               (previous.get("total_tokens") or 0) else previous)
+    for name in ("prompt_tokens_details", "input_tokens_details", "completion_tokens_details"):
+        if isinstance(out.get(name), dict):
+            out[name] = dict(out[name])
+            out[name].pop("cached_tokens", None)
+    for name in ("cached_tokens", "prompt_cache_hit_tokens", "cache_read_input_tokens"):
+        out.pop(name, None)
+    if "cache_observed" in out:
+        out["cache_observed"] = count is not None
+    if field is not None:
+        if len(field) == 2:
+            details = out.get(field[0])
+            out[field[0]] = dict(details) if isinstance(details, dict) else {}
+            out[field[0]][field[1]] = count
+        else:
+            out[field[0]] = count
+    return out
+
+def _row_cache_observation(row):
+    """Historical numeric zero/rate zero was synthesized, so proves nothing.
+
+    A positive legacy count proves a hit. New rows explicitly attest zero.
+    Raw alias presence also proves an observation when preserved by a writer.
+    """
+    count, field = _cache_observation(row)
+    if row.get("cache_observed") is True:
+        return count
+    if count is not None and (count > 0 or field != ("cached_tokens",)):
+        return count
+    return None
+
+
+def _row_cache_pct(row):
+    count = _row_cache_observation(row)
+    prompt = row.get("prompt_tokens") or 0
+    return round(count * 100.0 / prompt, 1) if count is not None and prompt > 0 else None
+
+
+def _cache_stats():
+    return {"cache_observed_requests": 0, "cache_unknown_requests": 0,
+            "cache_observed_prompt_tokens": 0}
+
+
+def _cache_fold(bucket, row):
+    known = _row_cache_observation(row) is not None
+    bucket["cache_observed_requests" if known else "cache_unknown_requests"] += 1
+    if known:
+        bucket["cache_observed_prompt_tokens"] += row.get("prompt_tokens") or 0
 
 
 def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_ms=None, fp=None,
@@ -1700,6 +1780,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
     if usage_missing:
         row["usage_missing"] = True
     row.update(fields)
+    row["cache_observed"] = fields.get("cache_observed", False)
     if fp:
         row.update(fp)
     if account:
@@ -1745,7 +1826,7 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         row["tokens_per_sec"] = round(fields.get("completion_tokens", 0) / (gen_ms / 1000.0), 2)
     # Share the denominator with the aggregate view (compute_usage_analytics),
     # otherwise the per-request row and the rollup disagree on the same data.
-    if fields.get("prompt_tokens", 0) > 0:
+    if row["cache_observed"] and fields.get("prompt_tokens", 0) > 0:
         row["cache_hit_pct"] = round(fields.get("cached_tokens", 0) * 100.0
                                      / fields["prompt_tokens"], 1)
     _persist_usage(row, "usage persist failed")
@@ -1758,8 +1839,9 @@ def record_usage(model, usage, stream=None, elapsed_ms=None, ttft_ms=None, gen_m
         key_tag = f" key={key_label(key)}" if key else ""
         speed_tag = f" {row.get('tokens_per_sec', 0)}t/s" if row.get("tokens_per_sec") else ""
         miss_tag = " usage=missing" if usage_missing else ""
+        cache_tag = " cache=%s" % (fields.get("cached_tokens", 0) if row["cache_observed"] else "unknown")
         if kind == "chat":
-            log(f"chat done: model={model}{acc_tag}{egress_tag}{key_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}{miss_tag}", tag="chat")
+            log(f"chat done: model={model}{acc_tag}{egress_tag}{key_tag}{dur} tokens={t_tokens} (in={fields.get('prompt_tokens',0)} out={fields.get('completion_tokens',0)}){speed_tag}{miss_tag}{cache_tag}", tag="chat")
         else:
             # 媒体请求没有 token 概念，日志行只说"谁的哪个模型、花了多少、用多久"，
             # 并用 kind 当 tag，这样「运行日志」页能单独筛出媒体。
@@ -1866,6 +1948,7 @@ def record_error(model, status, message, elapsed_ms=None, account=None,
     if gen_ms is not None:
         row["gen_ms"] = gen_ms
     row.update(fields)
+    row["cache_observed"] = fields.get("cache_observed", False)
     if fp:
         row.update(fp)
     if realm:
@@ -2095,10 +2178,10 @@ def _perf_stats_uncached(sample=5000, realm=None, since=None, until=None):
             tok_rates.append(r["tokens_per_sec"])
             for b in (mb, rb, ab):
                 b["tok_rates"].append(r["tokens_per_sec"])
-        if r.get("cache_hit_pct") is not None:
-            hits.append(r["cache_hit_pct"])
+        if _row_cache_pct(r) is not None:
+            hits.append(_row_cache_pct(r))
             for b in (mb, rb, ab):
-                b["hits"].append(r["cache_hit_pct"])
+                b["hits"].append(_row_cache_pct(r))
     block = _perf_block
     return {
         "sampled": total,
@@ -2392,7 +2475,7 @@ def _perf_line_entry(state, line):
     return (at, r.get("model") or "unknown", row_realm(r),
             r.get("account") or "(unattributed)", row_outcome(r),
             r.get("elapsed_ms"), r.get("ttft_ms"), r.get("gen_ms"),
-            r.get("tokens_per_sec"), r.get("cache_hit_pct"))
+            r.get("tokens_per_sec"), _row_cache_pct(r))
 
 
 def _perf_drop_oldest(state):
@@ -5187,7 +5270,8 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
         return
     # Read each tracked field once: the row lands in four buckets below and
     # every one of them walks the same fields.
-    present = [(k, row[k] or 0) for k in USAGE_FIELDS if k in row]
+    present = [(k, row[k] or 0) for k in USAGE_FIELDS if k in row and k != "cached_tokens"]
+    present.append(("cached_tokens", _row_cache_observation(row) or 0))
     m = model or "unknown"
     rr = row_realm(row)
     acct_id = row.get("account")
@@ -5196,19 +5280,21 @@ def _fold_usage_snapshot(row, snap, r, since, until, pricing_on=None, also=None,
     cny = cost["cny"] if known else 0.0
     for tgt in targets:
         tgt["requests"] += 1
+        _cache_fold(tgt, row)
         for k, value in present:
             tgt[k] += value
         _fold_cost(tgt, cost, model)
-        per = tgt["by_model"].setdefault(m, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
+        per = tgt["by_model"].setdefault(m, {**_cache_stats(), "requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
         per_realm = tgt["by_model_realm"].setdefault(m, {}).setdefault(
-            rr, {"requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
+            rr, {**_cache_stats(), "requests": 0, "accounts": {}, "cost_cny": 0.0, **{k: 0 for k in USAGE_FIELDS}})
         per_acct = (tgt["by_model_acct"].setdefault(m, {})
                     .setdefault(rr, {})
-                    .setdefault(acct_key, {"requests": 0, "accounts": {},
+                    .setdefault(acct_key, {**_cache_stats(), "requests": 0, "accounts": {},
                                            "cost_cny": 0.0,
                                            **{k: 0 for k in USAGE_FIELDS}}))
         for bucket in (per, per_realm, per_acct):
             bucket["requests"] += 1
+            _cache_fold(bucket, row)
             for k, value in present:
                 bucket[k] += value
             if known:
@@ -5915,19 +6001,15 @@ def _usage_timeseries_scan(realm, lo, hi, step):
                 if at < lo or at > hi:
                     continue
                 key = int((at - origin) // step)
-                bucket = buckets.setdefault(key, {
-                    "at": origin + key * step, "requests": 0, "errors": 0,
-                    "prompt_tokens": 0, "completion_tokens": 0,
-                    "reasoning_tokens": 0, "cached_tokens": 0,
-                    "total_tokens": 0, "credit": 0.0,
-                })
+                bucket = buckets.setdefault(key, _new_series_bucket(origin + key * step))
                 outcome = row_outcome(row)
                 if outcome == "completed":
                     bucket["requests"] += 1
+                    _cache_fold(bucket, row)
                     for field in ("prompt_tokens", "completion_tokens",
                                   "reasoning_tokens", "cached_tokens",
                                   "total_tokens"):
-                        bucket[field] += (row.get(field) or 0)
+                        bucket[field] += ((_row_cache_observation(row) or 0) if field == "cached_tokens" else (row.get(field) or 0))
                 else:
                     bucket["errors"] += 1
                 credit = row.get("credit") or 0
@@ -6860,6 +6942,8 @@ def recent_usage(limit=100, realm=None, page=1):
     # are all None when the row is unpriced - the panel must say so rather
     # than show a made-up 0.
     for r in page_rows:
+        r["cache_hit_pct"] = _row_cache_pct(r)
+        r["cache_observed"] = _row_cache_observation(r) is not None
         # 面板「最近请求」要显示发起方，而 usage.jsonl 里存的是 key 的 id；
         # 这里补一个可读的显示名（见 key_label），前端直接渲染成列。
         r["key_name"] = key_label(r.get("key"))
@@ -7682,15 +7766,16 @@ def _fold_usage_by_account(row, buckets):
     bucket = buckets.get(key)
     if bucket is None:
         bucket = buckets[key] = {
-            "account": key, "requests": 0, "prompt_tokens": 0,
+            **_cache_stats(), "account": key, "requests": 0, "prompt_tokens": 0,
             "completion_tokens": 0, "reasoning_tokens": 0,
             "cached_tokens": 0, "total_tokens": 0, "models": {},
         }
     bucket["requests"] += 1
+    _cache_fold(bucket, row)
     bucket["prompt_tokens"] += row.get("prompt_tokens") or 0
     bucket["completion_tokens"] += row.get("completion_tokens") or 0
     bucket["reasoning_tokens"] += row.get("reasoning_tokens") or 0
-    bucket["cached_tokens"] += row.get("cached_tokens") or 0
+    bucket["cached_tokens"] += _row_cache_observation(row) or 0
     bucket["total_tokens"] += row.get("total_tokens") or 0
     model = row.get("model") or "?"
     models = bucket["models"]
@@ -7800,7 +7885,7 @@ def usage_analytics_etag(realm=None, range=None, since=None, until=None):
 
 def _new_analytics_stat():
         return {
-            "requests": 0, "errors": 0,
+            **_cache_stats(), "requests": 0, "errors": 0,
             "prompt_tokens": 0, "completion_tokens": 0, "reasoning_tokens": 0,
             "cached_tokens": 0, "total_tokens": 0,
             "credit": 0.0,
@@ -7850,12 +7935,13 @@ def _analytics_row_values(row):
     return (row.get("prompt_tokens") or 0,
             row.get("completion_tokens") or 0,
             row.get("reasoning_tokens") or 0,
-            row.get("cached_tokens") or 0,
+            _row_cache_observation(row) or 0,
             row.get("total_tokens") or 0,
             row.get("credit") or 0,
             row.get("ttft_ms"),
             row.get("tokens_per_sec"),
-            row.get("elapsed_ms"))
+            row.get("elapsed_ms"),
+            _row_cache_observation(row) is not None)
 
 
 def _feed_analytics(stat_obj, vals, is_err, cost_cny):
@@ -7872,6 +7958,9 @@ def _feed_analytics(stat_obj, vals, is_err, cost_cny):
         stat_obj["errors"] += 1
     else:
         stat_obj["requests"] += 1
+    stat_obj["cache_observed_requests" if vals[9] else "cache_unknown_requests"] += 1
+    if vals[9]:
+        stat_obj["cache_observed_prompt_tokens"] += vals[0]
     stat_obj["prompt_tokens"] += vals[0]
     stat_obj["completion_tokens"] += vals[1]
     stat_obj["reasoning_tokens"] += vals[2]
@@ -9311,7 +9400,7 @@ _SERIES_MINUTE_RING_CAP = 720
 
 def _new_series_bucket(at):
     """一个时间序列桶；键序与 _usage_timeseries_uncached 的输出逐字一致。"""
-    return {"at": at, "requests": 0, "errors": 0, "prompt_tokens": 0,
+    return {**_cache_stats(), "at": at, "requests": 0, "errors": 0, "prompt_tokens": 0,
             "completion_tokens": 0, "reasoning_tokens": 0, "cached_tokens": 0,
             "total_tokens": 0, "credit": 0.0}
 
@@ -9326,9 +9415,10 @@ def _feed_series_bucket(bucket, row):
     outcome = row_outcome(row)
     if outcome == "completed":
         bucket["requests"] += 1
+        _cache_fold(bucket, row)
         for field in ("prompt_tokens", "completion_tokens", "reasoning_tokens",
                       "cached_tokens", "total_tokens"):
-            bucket[field] += (row.get(field) or 0)
+            bucket[field] += ((_row_cache_observation(row) or 0) if field == "cached_tokens" else (row.get(field) or 0))
     else:
         bucket["errors"] += 1
     if outcome != "client_aborted":
@@ -9485,7 +9575,8 @@ def _usage_series_state_ready(r):
 
 def _series_output_bucket(bucket):
     """存量桶 -> 输出桶（键序固定；日桶的 hours 子表不进输出）。"""
-    return {"at": bucket["at"], "requests": bucket["requests"],
+    return {**{k: bucket[k] for k in _cache_stats()},
+            "at": bucket["at"], "requests": bucket["requests"],
             "errors": bucket["errors"], "prompt_tokens": bucket["prompt_tokens"],
             "completion_tokens": bucket["completion_tokens"],
             "reasoning_tokens": bucket["reasoning_tokens"],
@@ -9845,11 +9936,11 @@ def _enrich_accounts_from_pool(acct_map, realm=None):
 
 
 def _finalize_analytics_stat(stat_obj):
-        p = stat_obj["prompt_tokens"]
+        p = stat_obj["cache_observed_prompt_tokens"]
         c = stat_obj["cached_tokens"]
         out = stat_obj["completion_tokens"]
         reas = stat_obj["reasoning_tokens"]
-        stat_obj["cache_hit_pct"] = round((c / p * 100), 1) if p > 0 else 0.0
+        stat_obj["cache_hit_pct"] = round((c / p * 100), 1) if p > 0 else None
         stat_obj["reasoning_ratio"] = round((reas / out * 100), 1) if out > 0 else 0.0
         stat_obj["ttft_ms_avg"] = round(stat_obj["ttft_sum"] / stat_obj["ttft_n"]) if stat_obj["ttft_n"] > 0 else 0
         stat_obj["speed_avg"] = round(stat_obj["speed_sum"] / stat_obj["speed_n"], 1) if stat_obj["speed_n"] > 0 else 0.0
@@ -9957,7 +10048,7 @@ _USAGE_CACHE_KIND_NAME = "usage-aggregate-cache-%s.json"
 # d2, d3] / ["off"]）换成「折叠行真正用到的价」记录（T15）。旧条目的字段形状
 # 对不上新判定，采纳端直接拒——升级后第一次刷新一次性重折（与 v3→v4 同处置），
 # 之后价表再变只按「用到的价」判废（无关模型的价变动不再重折）。
-_USAGE_CACHE_SCHEMA = 5
+_USAGE_CACHE_SCHEMA = 6
 # 升级前唯一布局的版本号：v3 单文件。只出现在只读回退路径上。
 _USAGE_CACHE_LEGACY_SCHEMA = 3
 # 五类状态的固定集合（文件名、kind 标签与写盘循环都用它）。
@@ -10420,7 +10511,7 @@ _USAGE_CACHE_SNAPSHOT_NUMBERS = tuple(
     if isinstance(v, (int, float)) and not isinstance(v, bool))
 _USAGE_CACHE_SNAPSHOT_MAPS = ("cost_missing", "by_model", "by_model_realm", "by_model_acct")
 _USAGE_CACHE_ANALYTICS_NUMBERS = tuple(_new_analytics_stat().keys())
-_USAGE_CACHE_BUCKET_NUMBERS = ("requests", "cost_cny") + USAGE_FIELDS
+_USAGE_CACHE_BUCKET_NUMBERS = ("requests", "cost_cny") + USAGE_FIELDS + tuple(_cache_stats())
 # 时间序列桶的数字字段（_new_series_bucket 的键，含 at）。从构造函数推导，
 # 与上面两条同一个道理：上游加字段时校验自动跟着收。
 _USAGE_CACHE_SERIES_NUMBERS = tuple(_new_series_bucket(0).keys())
@@ -10689,7 +10780,8 @@ def _usage_cache_buckets_ok(buckets):
         if not isinstance(bucket.get("account"), str):
             return False
         for field in ("requests", "prompt_tokens", "completion_tokens",
-                      "reasoning_tokens", "cached_tokens", "total_tokens"):
+                      "reasoning_tokens", "cached_tokens", "total_tokens",
+                      *_cache_stats()):
             if not _usage_cache_number(bucket.get(field)):
                 return False
         if not _usage_cache_counts_ok(bucket.get("models")):
@@ -11205,7 +11297,7 @@ def _copy_snapshot_day(bucket):
 # 字节；credit 在最后，与 _new_series_bucket 的键序一致）。
 _SERIES_MINUTE_FIELDS = ("requests", "errors", "prompt_tokens",
                          "completion_tokens", "reasoning_tokens",
-                         "cached_tokens", "total_tokens", "credit")
+                         "cached_tokens", "total_tokens", "credit") + tuple(_cache_stats())
 
 
 def _usage_cache_minutes_copy(minutes):
@@ -18511,8 +18603,7 @@ def aggregate_stream(raw_iter, model, resp_id):
             resp_id = chunk["id"]
         u = chunk.get("usage")
         if u:
-            if usage is None or (u.get("total_tokens") or 0) >= (usage.get("total_tokens") or 0):
-                usage = u
+            usage = _merge_usage_frame(usage, u)
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             if delta.get("content"):
@@ -18614,13 +18705,13 @@ def aggregate_stream(raw_iter, model, resp_id):
         if full_c or full_r:
             comp = estimate_tokens(full_c) + estimate_tokens(full_r)
             prompt_est = max(1, comp // 2)
-            usage = {
+            usage = _merge_usage_frame(usage, {
                 "prompt_tokens": prompt_est,
                 "completion_tokens": comp,
                 "total_tokens": prompt_est + comp,
                 "completion_tokens_details": {"reasoning_tokens": estimate_tokens(full_r)},
-                "prompt_tokens_details": {"cached_tokens": 0},
-            }
+                "cache_observed": False,
+            })
     out = {
         "id": resp_id or f"chatcmpl-wb-{uuid.uuid4().hex[:16]}",
         "object": "chat.completion",
@@ -19070,6 +19161,24 @@ def web_tools_active(body):
 
 
 def sum_usage(total, part):
+    """Sum tool rounds; the complete request is known only if every round is."""
+    if not isinstance(part, dict):
+        return total
+    previous = _cache_observation(total)[0] if isinstance(total, dict) else 0
+    current = _cache_observation(part)[0]
+    out = _sum_usage_values(total, part)
+    out["cache_observed"] = previous is not None and current is not None
+    # Canonicalize summed aliases: different rounds may report different fields.
+    for name in ("prompt_tokens_details", "input_tokens_details", "completion_tokens_details"):
+        if isinstance(out.get(name), dict):
+            out[name].pop("cached_tokens", None)
+    for name in ("prompt_cache_hit_tokens", "cache_read_input_tokens"):
+        out.pop(name, None)
+    out["cached_tokens"] = (previous or 0) + (current or 0)
+    return out
+
+
+def _sum_usage_values(total, part):
     """把一轮的 token 用量累加起来。
 
     代跑网路工具会多跑好几次上游，那些 token 是真的花掉的，所以记帐要加总，
@@ -19081,7 +19190,7 @@ def sum_usage(total, part):
         total = {}
     for key, value in part.items():
         if isinstance(value, dict):
-            total[key] = sum_usage(total.get(key), value)
+            total[key] = _sum_usage_values(total.get(key), value)
         elif isinstance(value, (int, float)) and not isinstance(value, bool):
             total[key] = (total.get(key) or 0) + value
         elif key not in total:
@@ -20118,10 +20227,8 @@ def _anthropic_usage(usage):
 
     prompt_tokens = _as_int(usage.get("prompt_tokens"))
     out["output_tokens"] = _as_int(usage.get("completion_tokens"))
-    cached = usage.get("prompt_cache_hit_tokens")
-    if cached is None:
-        cached = _best_cached_tokens(usage)
-    cache_read = _as_int(cached)
+    cache_read = _best_cached_tokens(usage)
+    out["cache_observed"] = _cache_observation(usage)[0] is not None
     cache_creation = _as_int(usage.get("prompt_cache_write_tokens"))
     out["cache_read_input_tokens"] = cache_read
     out["cache_creation_input_tokens"] = cache_creation
@@ -20319,7 +20426,7 @@ def stream_messages_events(raw_iter, model, holder=None):
         # carries both the usage block and the finish_reason (and no delta),
         # so skipping it here would zero out every streaming usage row.
         if isinstance(chunk.get("usage"), dict):
-            state["usage"] = chunk["usage"]
+            state["usage"] = _merge_usage_frame(state.get("usage"), chunk["usage"])
         choices = chunk.get("choices") if isinstance(chunk.get("choices"), list) else []
         if not choices:
             continue
@@ -20425,10 +20532,10 @@ def _responses_usage(u):
     det = u.get("completion_tokens_details") or {}
     pdet = u.get("prompt_tokens_details") or {}
     return {
+        "cache_observed": _cache_observation(u)[0] is not None,
         "input_tokens": u.get("prompt_tokens") or 0,
         "input_tokens_details": {
-            "cached_tokens": u.get("prompt_cache_hit_tokens")
-            or det.get("cached_tokens") or pdet.get("cached_tokens") or 0,
+            "cached_tokens": _best_cached_tokens(u),
         },
         "output_tokens": u.get("completion_tokens") or 0,
         "output_tokens_details": {"reasoning_tokens": det.get("reasoning_tokens") or 0},
@@ -20841,13 +20948,13 @@ def stream_responses_events(upstream, model, holder):
             if out_txt or rs_txt:
                 comp = estimate_tokens(out_txt) + estimate_tokens(rs_txt)
                 prompt_est = max(1, estimate_tokens(str(meta.get("input") or "")))
-                usage = {
+                usage = _merge_usage_frame(usage, {
                     "prompt_tokens": prompt_est,
                     "completion_tokens": comp,
                     "total_tokens": prompt_est + comp,
                     "completion_tokens_details": {"reasoning_tokens": estimate_tokens(rs_txt)},
-                    "prompt_tokens_details": {"cached_tokens": 0},
-                }
+                    "cache_observed": False,
+                })
                 holder["usage"] = usage
         # DeepSeek occasionally burns the whole round on reasoning and returns
         # no text at all. Emitting response.completed here makes the client
@@ -20900,9 +21007,8 @@ def stream_responses_events(upstream, model, holder):
             continue
         u = chunk.get("usage")
         if u:
-            if usage is None or (u.get("total_tokens") or 0) >= (usage.get("total_tokens") or 0):
-                usage = u
-                holder["usage"] = usage
+            usage = _merge_usage_frame(usage, u)
+            holder["usage"] = usage
         for choice in chunk.get("choices") or []:
             delta = choice.get("delta") or {}
             piece = delta.get("reasoning_content")
@@ -27416,8 +27522,7 @@ class Handler(BaseHTTPRequestHandler):
                         if isinstance(maybe, dict):
                             u = maybe.get("usage")
                             if u:
-                                if last_usage is None or (u.get("total_tokens") or 0) >= (last_usage.get("total_tokens") or 0):
-                                    last_usage = u
+                                last_usage = _merge_usage_frame(last_usage, u)
                                 # Usage belongs in a trailing choices-less frame (the
                                 # include_usage contract), not on a chunk that also
                                 # carries choices: strict clients and downstream
@@ -27547,13 +27652,13 @@ class Handler(BaseHTTPRequestHandler):
                 full_s = "".join(streamed_text)
                 if full_s:
                     comp = estimate_tokens(full_s)
-                    last_usage = {
+                    last_usage = _merge_usage_frame(last_usage, {
                         "prompt_tokens": max(1, comp // 2),
                         "completion_tokens": comp,
                         "total_tokens": max(1, comp // 2) + comp,
                         "completion_tokens_details": {"reasoning_tokens": 0},
-                        "prompt_tokens_details": {"cached_tokens": 0},
-                    }
+                        "cache_observed": False,
+                    })
             outcome = "failed" if pending_finish == "error" else "completed"
             if outcome == "failed":
                 record_error(getattr(upstream, "_wb_billed_model", model), 502, "upstream stream finished with error",
