@@ -1,4 +1,6 @@
 """Request-local routing namespace; never a client/upstream session identifier."""
+from __future__ import annotations
+
 import contextvars
 import hashlib
 import json
