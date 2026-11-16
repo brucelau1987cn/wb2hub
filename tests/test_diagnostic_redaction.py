@@ -263,6 +263,117 @@ class TestDiagnosticLogging(unittest.TestCase):
                    'requestId': 'req-123', 'method': 'POST', 'endpoint': '/v1/chat/completions'}
         self.assertEqual(json.loads(diagnostic_detail(json.dumps(payload))), payload)
 
+    def assert_runtime_sinks(self, source, expected=None, forbidden=('FAKE',)):
+        """Exercise console, memory, real SQLite and both filtered read paths."""
+        import tempfile
+        from wb_logstore import LogStore
+        ns = gateway_code()
+        with tempfile.TemporaryDirectory() as directory:
+            store = LogStore(str(Path(directory) / 'logs.sqlite3'))
+            store.configure(enabled=True)
+            ns['LOG_STORE'] = store
+            try:
+                ns['log'](source)
+                ns['_LOG_QUEUE'].put(None)
+                ns['_log_writer_loop']()
+                memory = ns['LOG_BUFFER'][-1]['msg']
+                result: Any = store.query()
+                stored = result['logs'][0]['msg']
+                db_read = ns['get_logs']()['logs'][0]['msg']
+                ns['LOG_STORE'] = None
+                memory_read = ns['get_logs']()['logs'][0]['msg']
+                console = ns['sys'].stderr.getvalue()
+                for output in (memory, stored, db_read, memory_read, console):
+                    for secret in forbidden:
+                        self.assertNotIn(secret, output)
+                    if expected is not None:
+                        self.assertIn(expected, output)
+                self.assertEqual([stored, db_read, memory_read], [memory] * 3)
+                return memory
+            finally:
+                store.close()
+
+    def test_braces_inside_credentials_never_become_diagnostic_objects(self):
+        for source in ('HTTP 401 password="FAKE-prefix{}FAKE-suffix"',
+                       'HTTP 401 Authorization: Bearer FAKE-prefix{}FAKE-suffix',
+                       'HTTP 401 Bearer FAKE-prefix{}FAKE-suffix'):
+            with self.subTest(source=source):
+                output = self.assert_runtime_sinks(source, expected='HTTP 401')
+                self.assertIn('<redacted>', output)
+
+    def test_ambiguous_unquoted_credentials_and_equals_headers_are_opaque(self):
+        for source in ('HTTP 401 Cookie=sid=FAKE-session;other=FAKE-other',
+                       'HTTP 401 Authorization=Digest username=FAKE-user,response=FAKE-response',
+                       'HTTP 401 password=abc,FAKE-suffix',
+                       'HTTP 401 password=abc;FAKE-suffix',
+                       'HTTP 401 password=abc&FAKE-suffix',
+                       'HTTP 401 password=abc}FAKE-suffix',
+                       'HTTP 401 password=abc FAKE suffix',
+                       'HTTP 401 Cookie="FAKE-session";other=FAKE-other'):
+            with self.subTest(source=source):
+                self.assert_runtime_sinks(source, expected='HTTP 401')
+
+    def test_payload_mentions_inside_json_preserve_the_envelope(self):
+        for field in ('message', 'reason', 'detail'):
+            raw = json.dumps({'code': 401, field: 'body=FAKE-sensitive',
+                              'requestId': 'req-safe'})
+            for prefix in ('', 'HTTP 401 '):
+                with self.subTest(field=field, prefix=prefix):
+                    output = self.assert_runtime_sinks(prefix + raw, expected='req-safe')
+                    envelope = json.loads(output[len(prefix):])
+                    self.assertEqual(envelope['code'], 401)
+                    self.assertEqual(envelope[field], '[payload omitted]')
+
+    def test_messages_summary_keeps_model_status_and_numeric_token_metadata(self):
+        source = ('messages: model=deepseek-v4.1-flash stream=True msgs=2 '
+                  "effort='high' tools=1 key=pool")
+        self.assertEqual(self.assert_runtime_sinks(source, expected=source), source)
+        for source in ('messages: FAKE-client-content',
+                       'messages: model=FAKE-content not a metric summary',
+                       'HTTP 400 body=FAKE-prefix{}FAKE-suffix'):
+            with self.subTest(source=source):
+                self.assert_runtime_sinks(source, expected='[payload omitted]')
+
+    def test_long_structured_reason_stays_valid_and_stable_across_sinks(self):
+        from wb_diagnostics import diagnostic_detail
+        for prefix in ('', 'HTTP 401 '):
+            for reason in ('拒绝 ' + '界' * 6000 + ' password="FAKE-secret"',
+                           'upstream ' + '\\"\\\\' * 4000):
+                with self.subTest(prefix=prefix, reason=reason[:10]):
+                    raw = prefix + json.dumps({'reason': reason, 'code': 401,
+                                               'requestId': 'req-safe'}, ensure_ascii=False)
+                    once = diagnostic_detail(raw)
+                    output = self.assert_runtime_sinks(once, expected='req-safe')
+                    self.assertEqual(output, once)
+                    self.assertLessEqual(len(output), 4096)
+                    obj = json.loads(output[len(prefix):])
+                    self.assertEqual(obj['code'], 401)
+                    self.assertTrue(obj['reason'].startswith(reason[:3]))
+                    for _ in range(4):
+                        self.assertEqual(diagnostic_detail(output), once)
+                    for limit in (180, 512, 4096):
+                        bounded = diagnostic_detail(raw, limit=limit)
+                        self.assertLessEqual(len(bounded), limit)
+                        self.assertEqual(diagnostic_detail(bounded, limit=limit), bounded)
+                        self.assertEqual(json.loads(bounded[len(prefix):])['requestId'], 'req-safe')
+
+    def test_quoted_credentials_before_error_envelopes_survive_repeated_sinks(self):
+        from wb_diagnostics import diagnostic_detail
+        raw = 'HTTP 401 password="FAKE-prefix{}FAKE-suffix" ' + json.dumps(
+            {'code': 401, 'reason': 'upstream rejected', 'requestId': 'req-safe'})
+        once = diagnostic_detail(raw)
+        output = self.assert_runtime_sinks(once, expected='req-safe')
+        self.assertEqual(output, once)
+        self.assertIn('upstream rejected', output)
+
+    def test_structured_credentials_treat_inner_labels_as_opaque(self):
+        for value in ('password="FAKE-prefix body=FAKE-suffix"',
+                      'password="FAKE-prefix Authorization: FAKE-suffix"',
+                      'password="FAKE-prefix Bearer FAKE-suffix"'):
+            with self.subTest(value=value):
+                raw = json.dumps({'code': 401, 'reason': value, 'requestId': 'req-safe'})
+                self.assert_runtime_sinks(raw, expected='req-safe')
+
     def test_unicode_limit_and_innocuous_metadata(self):
         from wb_diagnostics import diagnostic_detail
         for size in (4095, 4096, 4097, 5000):

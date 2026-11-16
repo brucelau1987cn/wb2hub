@@ -50,9 +50,24 @@ accounting was ported.
 - Keep HTTP/business codes, model IDs, request IDs, numeric token counts and
   ordinary `key=pool` / status text. Do not guess that arbitrary long hex or
   base64 identifiers are secrets. Existing phone masking remains independent.
-- Header lines and explicit payload assignments are opaque through the end of
-  their line. Metadata after one on the same line can be lost deliberately;
-  call sites should put useful status/code metadata before opaque values.
+- Header lines (`:` or `=`), bearer/basic schemes, and explicit payload
+  assignments are opaque through the end of their line. Unquoted credential
+  assignments also consume the rest of the line: commas, semicolons, ampersands,
+  spaces and braces are not trustworthy credential delimiters. Explicitly quoted
+  values retain their quote boundary around the redaction marker, so repeated
+  sinks cannot swallow a following diagnostic envelope. Useful metadata should
+  precede opaque spans. Only the gateway's exact metric-only
+  `messages: model=… stream=… msgs=… effort=… tools=… key=…` shape is exempted
+  from the payload-label rule; arbitrary Messages content remains omitted.
+- Object scanning processes opaque spans in source order before looking for a
+  brace inside them. Actual JSON objects are decoded before any string filtering;
+  `message: "body=…"` cannot break JSON or remove sibling code/request ID fields.
+- Long projected envelopes are bounded by shortening string values before JSON
+  serialization (including escaping overhead), never by slicing JSON syntax.
+  Repeated filtering preserves the bounded representation, scalar codes, request
+  IDs and reason prefixes when they fit. If the envelope's fixed syntax alone
+  exceeds an unusually tiny limit, a valid empty object is used where it fits;
+  metadata preservation is not possible under every caller-selected limit.
 - This is defense in depth, **not** a guarantee that arbitrary free text is
   safe. Do not pass prompts, request bodies or HTTP headers to logging.
 
@@ -94,7 +109,7 @@ No production accounts, mounts, network probes, pushes, merges or deployment.
 TDD red/green transcripts and broader suite logs are recorded outside the tree
 under `/root/.hermes/cache/scratch/wb2hub-logs-evidence/`.
 
-Verified offline results for this branch:
+Original implementation evidence (before this independent-review follow-up):
 - New redaction suite: **19 tests passed** (`28-green.log`).
 - Maintenance discovery: **143 tests passed**, no skips (`29-maintenance-final.log`).
 - Archived nickname/privacy: **38 tests passed** (`30-privacy-final.log`).
@@ -106,6 +121,34 @@ Verified offline results for this branch:
 - `git diff --check` passed. AST comparison confirms no session/affinity or
   cache extraction/aggregation function was edited.
 
+## Independent-review follow-up verification
+
+Baseline `d2d8b1c`, branch `fix/buddy-log-review`. New regressions exercise real
+console output, the in-memory buffer, real SQLite writes, and both memory/SQLite
+read filtering. RED/GREEN pairs reproduce and fix brace-bearing credentials,
+ambiguous unquoted credential boundaries and equals-delimited headers, JSON
+payload-label mentions/metric summaries, and repeated structured truncation.
+Quoted markers followed by envelopes have an additional RED/GREEN pair.
+
+Evidence: `/root/.hermes/cache/scratch/wb2hub-log-review-evidence/`:
+
+- `01-high1-red.log` / `02-high1-green.log`
+- `03-high2-red.log` / `04-high2-green.log`
+- `06-med3-red.log` / `07-med3-green.log`
+- `08-med4-red.log` / `09-med4-green.log`
+- `14-marker-red.log` / `15-marker-green.log`
+- `17-maintenance-final.log`: **174 tests passed**, including **26 diagnostic
+  regressions**, no skips.
+- `18-allowlist-final.log` and `upstream-final/summary.json`: **9 suites passed**,
+  no skips/errors/failures.
+- `19-privacy-final.log`: **38 tests passed**.
+
+All ran in existing `wb2hub:buddy-upgrade-tests` with `--network none`,
+`--cap-drop ALL`, `no-new-privileges`, read-only `/src`, disposable output,
+no production accounts/mounts or external network. Only the standalone diagnostic
+helper, its tests and this document changed; parser/client bodies, account fault
+classification, cache/session functions and central licenses are untouched.
+
 ## Explicit limits / not claimed covered
 
 - Existing `http_error_detail` / `read_http_error` may already read/truncate raw
@@ -113,6 +156,17 @@ Verified offline results for this branch:
   diagnostic arrives here. This change does not alter parser/client-body
   contracts; a bare JWT already cut before its second dot cannot be reliably
   recognized. Complete text passed to this helper is filtered before truncation.
+- Caller audit on this review baseline also found `str(exc)[:120]` passed to
+  `charge_account` and `account.note_error` in the dispatch unknown-error path,
+  and `str(exc)[:80]` passed to `account.note_error` in `test_account`. These are
+  deliberately **not** changed: `note_error` derives `token_expired` from its
+  original argument, so simply removing the slice or passing sanitized text
+  changes fault classification. `test_account` also passes the existing
+  80-character `http_error_message` label to the setter with separately bounded
+  raw detail. Already-cut unlabelled/JWT fragments can therefore remain
+  unrecognizable in those account-state paths. The complete-input setter tests
+  do not prove completeness of these callers. A future split between a bounded
+  classification label and full diagnostic input needs its own behavior tests.
 - Existing client-facing `/v1` errors are unchanged; this is not a global error
   rewrite, and must not be described as making client payloads secret-free.
 - Existing explicitly opted-in `WB_DUMP_11_128=full` evidence files can contain
