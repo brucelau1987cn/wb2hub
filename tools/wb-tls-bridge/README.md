@@ -16,12 +16,16 @@ groups `X25519 / P-256 / P-384`.
 
 ## Build
 
-Go 1.24 or newer is required.
+Go 1.25 or newer is required (the compression dependency sets this minimum).
+The Docker builder and CI use Go 1.26.11; Docker pins the official multi-platform
+`golang:1.26.11-bookworm` image by digest. See
+[the dependency security review](../../docs/BRIDGE-SECURITY.md) for evidence and limitations.
 
 ```sh
 cd tools/wb-tls-bridge
-go mod tidy
-go build -trimpath -ldflags="-s -w" -o wb-tls-bridge .
+go mod download
+go mod verify
+go build -mod=readonly -trimpath -ldflags="-s -w" -o wb-tls-bridge .
 ```
 
 Recommended repository-local names:

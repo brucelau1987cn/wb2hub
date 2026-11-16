@@ -1,5 +1,5 @@
 # Build on the native builder; cross-compile without requiring target emulation.
-FROM --platform=$BUILDPLATFORM golang:1.24.13-bookworm@sha256:1a6d4452c65dea36aac2e2d606b01b4a029ec90cc1ae53890540ce6173ea77ac AS tls-bridge-build
+FROM --platform=$BUILDPLATFORM golang:1.26.11-bookworm@sha256:dc40a13b61304647ed7e5d581d246b86413dfc29d63c6d018310feb93cd98fc0 AS tls-bridge-build
 WORKDIR /src
 ENV CGO_ENABLED=0 GOTOOLCHAIN=local
 COPY tools/wb-tls-bridge/go.mod tools/wb-tls-bridge/go.sum ./
