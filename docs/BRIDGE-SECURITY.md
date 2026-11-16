@@ -1,4 +1,9 @@
-# TLS bridge compression security update
+# TLS bridge dependency security updates
+
+Current source status: the Brotli follow-up below supersedes the remaining
+findings and Go 1.25 minimum recorded in the initial compress update.
+
+## Initial compress update (`6b6087a`)
 
 ## Scope and version choice
 
@@ -67,7 +72,8 @@ With `v1.20.4` it rejects the malformed count and passes. This reproduces the
 library bug, not a bridge/network exploit. Input attribution and the BSD license
 are retained in `security_test.go` and `licenses/compress.txt`.
 
-After updating, there are **no compress findings** (GO-2026-6865 and the older
+After the initial compress-only update, there were **no compress findings**
+(GO-2026-6865 and the older
 GO-2026-5841 module finding are both removed). The full scan is **not clean**:
 
 - GO-2026-6888 remains in `andybalholm/brotli v1.0.6` (fixed in `v1.2.7`).
@@ -89,7 +95,7 @@ The preserved `bin/wb-tls-bridge` remains the original rollback/comparison binar
 users running that file directly do **not** receive this fix. The default Docker
 build uses the rebuilt helper, not the preserved binary.
 
-## Verification
+## Initial compress-update verification
 
 Dependencies and the scanner were downloaded in disposable containers first.
 Actual Go checks and regressions then ran with `--network none`, capabilities
@@ -120,7 +126,108 @@ Builds retain pinned image/modules, `GOTOOLCHAIN=local`, `CGO_ENABLED=0`,
 `-mod=readonly`, `-trimpath`, `-buildvcs=false`, native-builder cross-compilation,
 and explicit executable mode. Runtime base/dependencies remain unchanged.
 
-## Raw evidence
+## Brotli follow-up (from `6b6087a`)
+
+This follow-up closes the remaining dependency findings without changing uTLS
+`v1.8.2`, the custom ClientHello, Python files, preserved binary, Docker/CI
+builder, Python runtime dependencies, models, client versions, or production state.
+Only source-built helpers receive these fixes.
+
+### Verified versions and compatibility decision
+
+- `github.com/andybalholm/brotli`: `v1.0.6` → **`v1.2.7`**, the advisory's
+  fixed version. Its verified `go.mod` requires Go 1.22. The proxy also reported
+  `v1.3.0` as latest; deliberately choose the smaller patched 1.2.x update.
+  [Fixed module metadata](https://proxy.golang.org/github.com/andybalholm/brotli/@v/v1.2.7.mod),
+  [advisory](https://vuln.go.dev/ID/GO-2026-6888.json),
+  [upstream fix](https://github.com/andybalholm/brotli/commit/33c2a9884269798192b5ecf171288f98939dbe42).
+- `golang.org/x/crypto`: `v0.36.0` → **`v0.59.0`**, verified stable proxy
+  release. The old scan's module-only SSH/OpenPGP findings are removed, including
+  GO-2026-5932 whose fix postdates `v0.58.0`. This does not add a separate
+  `golang.org/x/crypto/openpgp` module or import SSH/OpenPGP packages.
+  [Release](https://proxy.golang.org/golang.org/x/crypto/@latest),
+  [module requirements](https://proxy.golang.org/golang.org/x/crypto/@v/v0.59.0.mod).
+- `golang.org/x/sys`: `v0.31.0` → **`v0.50.0`**, required by crypto `v0.59.0`.
+  This also removes module-only GO-2026-5024 (fixed since `v0.44.0`).
+  [Module requirements](https://proxy.golang.org/golang.org/x/sys/@v/v0.50.0.mod).
+- Both x modules require Go **1.26.0**, so `go.mod` and both README copies now
+  declare that minimum. The already pinned **Go 1.26.11** Docker/CI toolchain
+  and image digest are unchanged; no Go 1.27 upgrade or automatic toolchain
+  download is needed. The earlier Go 1.25 compatibility result applies only to
+  the initial compress commit, not this follow-up. Removing all current module
+  findings with the existing verified builder was preferred to leaving them
+  behind solely to preserve the superseded Go 1.25 source minimum.
+- `go mod tidy` adds checksums for Brotli's test dependency `randomstring`;
+  the actual helper dependency list and binary metadata do not import it.
+  Other x modules visible in `go list -m all` are dependency-graph metadata,
+  not new imported runtime packages.
+
+All three modules were downloaded using Go's checksum verification, followed
+by offline `go mod verify`. Their **complete LICENSE files match both existing
+source/runtime license copies byte-for-byte**, so no artificial license-text
+change was made. SHA-256 of the verified files:
+
+```text
+brotli v1.2.7  3d180008e36922a4e8daec11c34c7af264fed5962d07924aea928c38e8663c94
+x/crypto v0.59.0, x/sys v0.50.0
+               911f8f5782931320f5b8d1160a76365b83aea6447ee6c04fa6d5591467db9dad
+```
+
+### Regression and actual vulnerability scan
+
+`TestSecurityDependencyFloors` was written and run before the updates: all
+three old versions failed their security floor. It passes after the minimal
+module updates. This is explicitly a dependency-policy regression, **not a
+fabricated memory-exhaustion reproducer**. The cited Brotli fix contains no
+public attack fixture; no claim is made to reproduce the advisory remotely.
+The existing FSE malformed-input and captured-ClientHello regressions also pass.
+The runtime reachability distinction in the initial review remains valid:
+no certificate-compression extension or ALPN was added.
+
+Real `govulncheck v1.9.0` source/symbol scans were rerun with Go 1.26.11 on Linux
+amd64 against `https://vuln.go.dev` (DB modified `2026-11-11T02:51:11Z`):
+
+| Result | Initial compress commit | This follow-up |
+| --- | --- | --- |
+| Unique advisory IDs with actual finding records | 22 | **0** |
+| Remaining static-symbol advisory | GO-2026-6888 | **none** |
+| Text exit / message | 3 / Brotli symbol finding | **0 / No vulnerabilities found** |
+| JSON exit / parsed finding records | 0 / nonempty | **0 / 0** |
+
+JSON was parsed as a stream of protocol objects and **`finding` records** were
+counted; OSV database payloads alone and exit code zero are not a clean-scan
+criterion. This is a clean result for this source scan/database snapshot, not a
+promise that every platform or future advisory is clean. No upstream probes
+were performed.
+
+### Follow-up verification
+
+- Offline, network-disabled Go 1.26.11: `go mod verify`, `go vet ./...`,
+  `go test -v -count=1 ./...`, CGO-disabled Linux amd64 + arm64 builds: **pass**.
+- Full Docker runtime build and arm64 `tls-bridge-artifact` export: **pass**;
+  helpers match independent same-toolchain builds byte-for-byte for both arches.
+  Arm64 is cross-compiled, not ARM-hardware execution.
+- Offline Docker maintenance suite: **60 passed**, no skips.
+- Offline Docker audited upstream allowlist: **9 suites passed**, no skips;
+  included real-helper TLS suite: **21 tests passed**, no skips.
+- Built runtime helper: **0755 / LISTEN / parent-EOF exit 0**; empty-account
+  `/health`: **ok=true, accounts=0**. No real upstream handshake is claimed.
+- `main.go`, existing ClientHello tests, preserved binary, Python business/test
+  files, Dockerfile and CI workflow remain unchanged from `6b6087a`.
+- Isolated image tags: `wb2hub-security-followup:runtime` and
+  `wb2hub-security-followup:tests`; no shared `wb2hub:*` tags were overwritten.
+  No amend, push, merge, production edit, or deployment is included.
+
+Follow-up evidence lives under the original evidence root in **`brotli-followup/`**:
+`red-dependency-floors.log`, `upgrade.log`, `offline-go-checks.log`,
+`final-govulncheck.{txt,json,log}`, `vulnerability-summary.json`,
+`brotli-v1.2.7.mod`, `brotli-security-fix.patch`, `crypto-v0.59.0.mod`,
+`sys-v0.50.0.mod`, `license-checksums.json`, `docker-build-amd64.log`,
+`docker-build-arm64.log`, `docker-test-image.log`, `reproducibility.log`,
+`maintenance.log`, `upstream.log`, `results/upstream/summary.json`,
+`results/upstream/_test_tls_fingerprint.py.log`, `smoke.log`, and compiled artifacts.
+
+## Initial raw evidence
 
 Absolute evidence root on the validation host:
 `/root/.hermes/cache/scratch/wb2hub-security-evidence/`.
