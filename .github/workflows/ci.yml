@@ -16,6 +16,13 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
+      - name: Validate both Compose entry points
+        env:
+          API_KEY: ci-only-not-a-production-key
+        run: |
+          python -m unittest discover -s tests -p test_compose_files.py -v
+          docker compose -f compose.yml config --quiet
+          docker compose -f docker-compose.yml config --quiet
       - name: Build runtime and helper from source
         run: docker build -t wb2hub:ci .
       - name: Build credential-free test image

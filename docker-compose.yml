@@ -1,0 +1,18 @@
+services:
+  wb2hub:
+    build: .
+    image: wb2hub:local
+    container_name: wb2hub
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${PORT:-7863}:7863"
+    environment:
+      HOST: 0.0.0.0
+      PORT: 7863
+      API_KEY: ${API_KEY:?Set API_KEY in .env}
+      TZ: ${TZ:-Asia/Shanghai}
+      WB_UPDATE_REPO: brucelau1987cn/wb2hub
+    volumes:
+      - ./accounts:/app/accounts
+      - ./usage:/app/usage
+      - ./subbridge-data:/app/subbridge-data
