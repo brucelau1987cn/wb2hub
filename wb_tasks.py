@@ -63,9 +63,8 @@ _log = lambda msg: None
 def set_logger(fn):
     """Route task diagnostics to the caller's logger.
 
-    The growth endpoints swallow their errors so one dead endpoint cannot
-    abort a whole cycle. Without a logger those failures are invisible, and an
-    upstream change looks identical to "no tasks today".
+    List failures propagate to their callers; optional summary endpoints log
+    partial failures so an upstream change is not silently "no tasks today".
     """
     global _log
     _log = fn or (lambda msg: None)
@@ -160,8 +159,52 @@ TEAM_ID_POOL = [
 ]
 
 
+class _GrowthProgressFailure(int):
+    """Zero earned credit with call-local failure evidence for numeric callers."""
+    ok: bool
+    error: str
+    terminal: bool
+
+    def __new__(cls, error):
+        result = super().__new__(cls, 0)
+        result.ok = False
+        result.error = str(error)
+        result.terminal = bool(getattr(error, "terminal", False))
+        return result
+
+
+class _GrowthError(RuntimeError):
+    code = None
+    terminal: bool = False
+
+
+def _growth_failure(message, code=None, cause=None, body=None, terminal=False):
+    """Per-call failure metadata; never mutate account/global restriction state."""
+    if isinstance(cause, urllib.error.HTTPError):
+        if body is None:
+            try:
+                body = cause.read(65537).decode("utf-8", "replace")
+                if len(body.encode("utf-8")) > 65536:
+                    terminal = True  # Oversized evidence cannot authorize more writes.
+            except Exception:
+                body = ""
+        if body:
+            message = f"{message}: {body}"
+            try:
+                code = json.loads(body).get("code", code)
+            except Exception:
+                pass
+    error = _GrowthError(message)
+    error.code = code if code is not None else getattr(cause, "code", None)
+    terminal_codes = ("401", "403", "429", "11140", "14003", "6004", "6005", "10001")
+    error.terminal = (terminal or str(error.code) in terminal_codes
+                      or str(getattr(cause, "code", None)) in terminal_codes
+                      or bool(getattr(cause, "terminal", False)))
+    return error
+
+
 def fetch_growth_tasks(account, mp=False):
-    """查询成长任务列表及当前状态。mp=True 时使用小程序专属标头查询。"""
+    """查询成功返回列表；读取/业务错误抛出 RuntimeError，不伪装空清单。"""
     if getattr(account, "is_enterprise", lambda: False)():
         return []
     url = CHAT_BASE + "/v2/activity/growth/tasks"
@@ -172,9 +215,14 @@ def fetch_growth_tasks(account, mp=False):
     try:
         with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            raw_tasks = (data.get("data") or {}).get("tasks") or []
+            if not isinstance(data, dict) or data.get("code") != 0:
+                raise _growth_failure("growth/tasks rejected: %s" % data,
+                                      code=data.get("code") if isinstance(data, dict) else None)
+            raw_tasks = (data.get("data") or {}).get("tasks")
+            if not isinstance(raw_tasks, list):
+                raise RuntimeError("growth/tasks missing or invalid tasks list")
             tasks = []
-            specs = MP_TASK_SPECS if mp else TASK_SPECS
+            specs = dict(TASK_SPECS, **MP_TASK_SPECS) if mp else TASK_SPECS
             for t in raw_tasks:
                 code = t.get("task_code") or ""
                 spec = specs.get(code, {})
@@ -184,7 +232,8 @@ def fetch_growth_tasks(account, mp=False):
                     "name": t.get("title") or spec.get("name") or code,
                     "description": t.get("description") or t.get("task_desc") or "",
                     "jump_url": t.get("jump_url") or "",
-                    "status": t.get("accept_status") or "not_accepted",
+                    "status": t.get("accept_status") or "unknown",
+                    "mp": mp,
                     "task_type": t.get("task_type") or "",
                     "current": prog.get("current", 0),
                     "target": prog.get("target", spec.get("target", 1)),
@@ -195,7 +244,29 @@ def fetch_growth_tasks(account, mp=False):
                 })
             return tasks
     except Exception as exc:
-        return []
+        _log(f"growth/tasks query failed (mp={mp}): {exc}")
+        raise _growth_failure(f"growth/tasks query failed (mp={mp}): {exc}", cause=exc) from exc
+
+
+def discover_growth_tasks(account):
+    """Query both views, deduplicate by code, retain origin and partial errors.
+
+    Default rows win duplicates; MP-only rows keep MP through the whole chain.
+    Failed reads are evidence errors, never equivalent to an empty task list.
+    """
+    tasks, errors, seen = [], [], set()
+    terminal = False
+    for mp in (False, True):
+        try:
+            for task in fetch_growth_tasks(account, mp=mp):
+                code = task["task_code"]
+                if code not in seen:
+                    tasks.append(dict(task, mp=mp))
+                    seen.add(code)
+        except Exception as exc:
+            errors.append(f"{'mp' if mp else 'default'}: {exc}")
+            terminal = terminal or _growth_failure(str(exc), cause=exc).terminal
+    return {"ok": not errors, "terminal": terminal, "tasks": tasks, "errors": errors}
 
 
 def fetch_growth_summary(account):
@@ -271,12 +342,16 @@ def accept_tasks(account, codes, chunk=20, mp=False):
     其它失败原因。过去这里只返回 bool 且吞掉异常, 接取失败时上层完全看不见,
     于是后续上报的事件全部作用在未接取的任务上 —— 进度永远 0, 领奖必然
     "task not completed", 表现就是"接取了一堆但一个都没点亮"。
-    现在返回 {"ok": bool, "accepted": [...], "failed": [...], "msg": str}。
+    accepted 只含同口径清单回读确认项。v2 成功但明确未落库时，整次调用
+    最多尝试一次 Web 接取，再回读；查询失败/缺失/未知状态不授权写入。
+    口径与回读思路参考 jin66god/workbuddy2api-panel v1.27.7 (MIT)。
     """
-    out = {"ok": True, "accepted": [], "failed": [], "msg": "", "reasons": []}
+    codes = list(dict.fromkeys(codes))
+    out = {"ok": True, "terminal": False, "accepted": [], "failed": [], "msg": "", "reasons": []}
     if not codes:
         return out
     url = CHAT_BASE + "/v2/activity/growth/tasks/accept"
+    web_attempted = False
     for i in range(0, len(codes), max(1, chunk)):
         part = codes[i:i + max(1, chunk)]
         body = json.dumps({"task_codes": part}).encode("utf-8")
@@ -291,7 +366,7 @@ def accept_tasks(account, codes, chunk=20, mp=False):
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
-                detail = exc.read(300).decode("utf-8", "replace")
+                detail = exc.read(65537).decode("utf-8", "replace")
             except Exception:
                 pass
             out["ok"] = False
@@ -299,6 +374,11 @@ def accept_tasks(account, codes, chunk=20, mp=False):
             out["failed"].extend(part)
             out["reasons"].append(out["msg"])
             _log(f"accept batch failed: {out['msg']}")
+            if _growth_failure(str(exc), cause=exc, body=detail,
+                               terminal=len(detail.encode("utf-8")) > 65536).terminal:
+                out["terminal"] = True
+                out["failed"].extend(codes[i + max(1, chunk):])
+                break
             continue
         except Exception as exc:
             out["ok"] = False
@@ -312,23 +392,82 @@ def accept_tasks(account, codes, chunk=20, mp=False):
             out["failed"].extend(part)
             out["reasons"].append(out["msg"])
             _log(f"accept rejected: {out['msg']}")
+            if _growth_failure(out["msg"], code=d.get("code")).terminal:
+                out["terminal"] = True
+                out["failed"].extend(codes[i + max(1, chunk):])
+                break
             continue
-        results = (d.get("data") or {}).get("results") or []
-        seen = set()
-        for item in results:
-            code = item.get("task_code")
-            st = str(item.get("status") or "")
-            seen.add(code)
-            if st in ("accepted", "already_accepted"):
-                out["accepted"].append(code)
-            else:
-                out["failed"].append(code)
-                out["reasons"].append("%s: %s" % (code, item.get("message") or st))
-                _log(f"task {code} accept status={st}")
-        for code in part:
-            if code not in seen:
-                out["failed"].append(code)
+        verified = set()
+        try:
+            fresh = fetch_growth_tasks(account, mp=mp)
+            verified = {t["task_code"] for t in fresh
+                        if t.get("status") in ("accepted", "in_progress", "completed", "claimed")}
+            # A successful receipt is not enrollment. Only explicitly unchanged
+            # rows authorize one Web retry, never missing/failed/unknown reads.
+            unchanged = [t["task_code"] for t in fresh
+                         if t["task_code"] in part and t.get("status") == "not_accepted"]
+            results = (d.get("data") or {}).get("results") or []
+            acknowledged = {r.get("task_code") for r in results
+                            if r.get("status") in ("accepted", "already_accepted")}
+            retry = [code for code in unchanged if not results or code in acknowledged]
+            if retry and not web_attempted:
+                web_attempted = True
+                web_req = urllib.request.Request(
+                    WEB_BASE + "/activity/growth/tasks/accept",
+                    data=json.dumps({"task_codes": retry}).encode("utf-8"),
+                    method="POST", headers=_growth_web_headers(account))
+                with _accounts.urlopen(web_req, timeout=15, proxy=account.proxy) as resp:
+                    web = json.loads(resp.read().decode("utf-8"))
+                if web.get("code") != 0:
+                    raise _growth_failure(f"Web accept rejected: {web}", code=web.get("code"))
+                fresh = fetch_growth_tasks(account, mp=mp)
+                verified.update(t["task_code"] for t in fresh
+                                if t.get("status") in ("accepted", "in_progress", "completed", "claimed"))
+        except Exception as exc:
+            error = _growth_failure(str(exc), cause=exc)
+            out["reasons"].append(f"接取回读失败: {error}")
+            out["terminal"] = error.terminal
+        out["accepted"].extend(code for code in part if code in verified)
+        out["failed"].extend(code for code in part if code not in verified)
+        if out["terminal"]:
+            out["failed"].extend(codes[i + max(1, chunk):])
+            break
+    out["ok"] = not out["failed"] and not out["terminal"]
     return out
+
+
+def _growth_web_headers(account):
+    """Official growth-center Web shape; not an authorization bypass."""
+    return {"Authorization": "Bearer " + account.access_token,
+            "Accept": "application/json, text/plain, */*", "Content-Type": "application/json",
+            "Origin": WEB_BASE, "Referer": WEB_BASE + "/profile/growth-center",
+            "x-client-platform": "web", "User-Agent": WEB_UA,
+            "X-User-Id": account.uid, "X-Domain": WEB_BASE}
+
+
+def _growth_claim_result(account, code, data, mp=False):
+    """Task claimed != new credit grant; keep legacy ok false without rewards."""
+    credit, energy = data.get("credit", 0), data.get("energy", 0)
+    valid = all(isinstance(n, (int, float)) and not isinstance(n, bool)
+                and n >= 0 and n < float("inf") for n in (credit, energy))
+    if valid and not data.get("already_claimed") and (credit > 0 or energy > 0):
+        return {"ok": True, "state": "rewarded", "reward_verified": True,
+                "credit": credit, "energy": energy,
+                "msg": f"奖励回执: +{credit} 积分 / +{energy} 能量"}
+    state, detail, terminal = "unknown", "任务状态未知", False
+    try:
+        fresh = next((t for t in fetch_growth_tasks(account, mp=mp)
+                      if t["task_code"] == code), None)
+        status = fresh.get("status") if fresh else None
+        if status == "claimed":
+            state, detail = "claimed", "任务已标记领取"
+        elif status in ("not_accepted", "accepted", "in_progress", "completed"):
+            state, detail = "pending", "任务尚未确认领取，等待后续核验"
+    except Exception as exc:
+        state, detail = "read_error", f"领奖回读失败: {exc}"
+        terminal = _growth_failure(str(exc), cause=exc).terminal
+    return {"ok": False, "terminal": terminal, "state": state, "reward_verified": False,
+            "credit": 0, "energy": 0, "msg": detail + "；未确认本次新增奖励"}
 
 
 def claim_task(account, code, mp=False):
@@ -343,10 +482,11 @@ def claim_task(account, code, mp=False):
             d = json.loads(resp.read().decode("utf-8"))
             if d.get("code") == 0:
                 data = d.get("data") or {}
-                return {"ok": True, "credit": data.get("credit", 0), "energy": data.get("energy", 0)}
+                return _growth_claim_result(account, code, data, mp=mp)
             # 200 + 非0码 (典型: 400 task not completed —— 进度还没落账就来领奖)
             _log(f"task {code} claim rejected: {d.get('msg')}")
-            return {"ok": False, "credit": 0, "energy": 0, "msg": d.get("msg") or f"code={d.get('code')}"}
+            return {"ok": False, "terminal": _growth_failure(str(d), code=d.get("code")).terminal,
+                    "credit": 0, "energy": 0, "msg": f"code={d.get('code')}: {d.get('msg') or ''}"}
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", "replace") if exc.fp else ""
         err_msg = f"HTTP {exc.code}"
@@ -354,7 +494,12 @@ def claim_task(account, code, mp=False):
             err_msg = json.loads(body).get("msg") or err_msg
         except Exception:
             pass
-        if exc.code == 400:
+        try:
+            error_code = json.loads(body).get("code")
+        except Exception:
+            error_code = None
+        terminal = _growth_failure(err_msg, code=error_code, cause=exc, body=body).terminal
+        if exc.code == 400 and not terminal:
             # 降级到 web 域领奖
             web_url = f"{WEB_BASE}/activity/growth/tasks/{code}/claim"
             web_hdrs = {
@@ -374,13 +519,16 @@ def claim_task(account, code, mp=False):
                     d = json.loads(resp.read().decode("utf-8"))
                     if d.get("code") == 0:
                         data = d.get("data") or {}
-                        return {"ok": True, "credit": data.get("credit", 0), "energy": data.get("energy", 0)}
+                        return _growth_claim_result(account, code, data, mp=mp)
                     _log(f"task {code} web claim rejected: code={d.get('code')} msg={d.get('msg')}")
-                    return {"ok": False, "credit": 0, "energy": 0, "msg": d.get("msg") or err_msg}
+                    return {"ok": False, "terminal": _growth_failure(str(d), code=d.get("code")).terminal,
+                            "credit": 0, "energy": 0, "msg": f"Web code={d.get('code')}: {d.get('msg') or err_msg}"}
             except Exception as exc2:
                 _log(f"task {code} web claim failed: {exc2}")
+                terminal = _growth_failure(str(exc2), cause=exc2).terminal
+                err_msg = str(exc2)
         _log(f"task {code} claim failed: {err_msg}")
-        return {"ok": False, "credit": 0, "energy": 0, "msg": err_msg}
+        return {"ok": False, "terminal": terminal, "credit": 0, "energy": 0, "msg": err_msg}
     except Exception as exc:
         _log(f"task {code} claim failed: {exc}")
     return {"ok": False, "credit": 0, "energy": 0}
@@ -483,10 +631,14 @@ def report_mp_events(account, events, base=None):
     try:
         with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
             d = json.loads(resp.read().decode("utf-8"))
+            error = _growth_failure(str(d), code=d.get("code"))
+            if error.terminal:
+                return _GrowthProgressFailure(error)
             return d.get("code") == 0
     except Exception as exc:
         _log(f"report_mp_events failed: {exc}")
-        return False
+        error = _growth_failure(str(exc), cause=exc)
+        return _GrowthProgressFailure(error) if error.terminal else False
 
 
 def build_event(account, kind, idx=0, expert=None):
@@ -587,9 +739,13 @@ def report_events(account, events, base=None):
     try:
         with _accounts.urlopen(req, timeout=15, proxy=account.proxy) as resp:
             d = json.loads(resp.read().decode("utf-8"))
+            error = _growth_failure(str(d), code=d.get("code"))
+            if error.terminal:
+                return _GrowthProgressFailure(error)
             return d.get("code") == 0
-    except Exception:
-        return False
+    except Exception as exc:
+        error = _growth_failure(str(exc), cause=exc)
+        return _GrowthProgressFailure(error) if error.terminal else False
 
 
 def _travel_status(account):
@@ -606,16 +762,20 @@ def ensure_buddy(account, gap=1.0):
     first_buddy 是 auto 类任务，其奖励（reward_buddy）就是 Buddy 实例；
     single 任务与猫猫旅行都以它为前提。返回是否已就绪。
     """
-    tasks = fetch_growth_tasks(account)
-    fb = next((t for t in tasks if t["task_code"] == "first_buddy"), None)
-    if fb is None:
+    try:
+        tasks = fetch_growth_tasks(account)
+        fb = next((t for t in tasks if t["task_code"] == "first_buddy"), None)
+        if fb is None:
+            return False
+        if fb["status"] == "claimed":
+            return True
+        _progress_one(account, fb, [], gap)
+        tasks = fetch_growth_tasks(account)
+        fb = next((t for t in tasks if t["task_code"] == "first_buddy"), None)
+        return bool(fb and fb["status"] == "claimed")
+    except Exception as exc:
+        _log(f"Buddy 前置清单回读失败: {exc}")
         return False
-    if fb["status"] == "claimed":
-        return True
-    _progress_one(account, fb, [], gap)
-    tasks = fetch_growth_tasks(account)
-    fb = next((t for t in tasks if t["task_code"] == "first_buddy"), None)
-    return bool(fb and fb["status"] == "claimed")
 
 
 def _travel_depart(account, lid):
@@ -709,10 +869,14 @@ def do_cat_travel(account):
 def _progress_one(account, t, logs, gap, claim=True):
     """推进单个任务并返回本次到账积分。
 
+    读取失败返回数值兼容的 _GrowthProgressFailure(0)，携带本次调用的
+    ok/error/terminal；批量调用者须检查元数据，不能把失败当成无奖励成功。
+
     auto 类任务不需要接取（上游 "task does not require acceptance"），事件可
     直接点亮；single 类未接取时上报不计进度，跳过等接取成功。
     """
     code = t["task_code"]
+    mp = bool(t.get("mp"))
     spec = TASK_SPECS.get(code)
     if not spec:
         dyn_expert = extract_expert_from_task(t)
@@ -734,17 +898,19 @@ def _progress_one(account, t, logs, gap, claim=True):
     # 已完成的任务先领奖 —— 桌面端/夜间任务也可能被真实操作完成
     # (例如用户自己在桌面端用了一次, 或夜里调度器点亮了), 这类任务必须
     # 先结算, 不能因为"只能靠真实操作"就直接跳过丢掉奖励。
-    if status == "completed" or cur >= tgt:
+    if status == "completed" or (tgt > 0 and cur >= tgt):
         if not claim:
             logs.append(f"⏸ 任务 [{spec['name']}] 已达成，等待手动领取")
             return 0
-        res = claim_task(account, code)
-        if res.get("ok"):
+        res = claim_task(account, code, **({"mp": True} if mp else {}))
+        if res.get("ok") and res.get("reward_verified") is True:
             cr = res.get("credit", 0)
             logs.append(f"✓ 任务 [{spec['name']}] 领奖成功: +{cr} 积分")
             time.sleep(gap)
             return cr
         logs.append(f"! 任务 [{spec['name']}] 领奖失败: {res.get('msg') or '未知原因'}")
+        if res.get("terminal"):
+            return _GrowthProgressFailure(_growth_failure(res.get("msg") or "领奖终止", terminal=True))
         time.sleep(gap)
         return 0
 
@@ -761,7 +927,7 @@ def _progress_one(account, t, logs, gap, claim=True):
                     f" (每日 01:00 调度器自动执行, 累计 3 天)")
         return 0
 
-    if status == "not_accepted" and t.get("task_type") != "auto":
+    if status not in ("accepted", "in_progress") and t.get("task_type") != "auto":
         # 接取没成功就上报是白费功夫: 上游只对已接取的任务累计进度。
         logs.append(f"⏭ 任务 [{spec['name']}] 仍未接取, 跳过 (先解决接取失败)")
         return 0
@@ -786,7 +952,11 @@ def _progress_one(account, t, logs, gap, claim=True):
         else:
             ev = build_event(account, kind, idx=i, expert=expert)
             ev_list = ev if isinstance(ev, list) else [ev]
-        if not report_events(account, ev_list):
+        report = report_events(account, ev_list)
+        if isinstance(report, _GrowthProgressFailure) and report.terminal:
+            logs.append(f"! 任务 [{spec['name']}] 上报终止: {report.error}")
+            return report
+        if not report:
             report_ok = False
         if i < need - 1:
             time.sleep(gap)
@@ -798,10 +968,20 @@ def _progress_one(account, t, logs, gap, claim=True):
     # 只有确实在动才继续等, 免得每个卡住的任务都空等 20 秒 (整轮要几分钟)。
     prog = cur
     for attempt in range(6):
-        fresh = next((x for x in fetch_growth_tasks(account) if x["task_code"] == code), None)
+        try:
+            fresh = next((x for x in fetch_growth_tasks(account, **({"mp": True} if mp else {}))
+                          if x["task_code"] == code), None)
+        except Exception as exc:
+            logs.append(f"! 任务 [{spec['name']}] 进度回读失败: {exc}，本轮不领奖")
+            return _GrowthProgressFailure(_growth_failure(str(exc), cause=exc))
         if fresh:
             prog = fresh.get("current", 0)
-            if prog >= tgt or fresh.get("status") in ("completed", "claimed"):
+            if fresh.get("status") == "claimed":
+                logs.append(f"任务 [{spec['name']}] 已标记领取，未确认本次新增奖励")
+                return 0
+            if fresh.get("status") == "completed":
+                prog = max(prog, tgt)
+            if prog >= tgt:
                 break
             if prog > cur:
                 # 已经在涨了, 值得多等一会儿
@@ -821,13 +1001,15 @@ def _progress_one(account, t, logs, gap, claim=True):
         logs.append(f"⏸ 任务 [{spec['name']}] 已点亮，等待手动领取")
         time.sleep(gap)
         return 0
-    res = claim_task(account, code)
-    if res.get("ok"):
+    res = claim_task(account, code, **({"mp": True} if mp else {}))
+    if res.get("ok") and res.get("reward_verified") is True:
         cr = res.get("credit", 0)
         logs.append(f"✓ 任务 [{spec['name']}] 点亮并领奖成功: +{cr} 积分")
         time.sleep(gap)
         return cr
     logs.append(f"! 任务 [{spec['name']}] 进度已达 {prog}/{tgt} 但领奖失败: {res.get('msg') or '未知原因'}")
+    if res.get("terminal"):
+        return _GrowthProgressFailure(_growth_failure(res.get("msg") or "领奖终止", terminal=True))
     time.sleep(gap)
     return 0
 
@@ -875,38 +1057,61 @@ def do_buddy_open(account):
         return {"ok": False, "action": "error", "opened": 0, "msg": f"Buddy 盲盒异常: {exc}"}
 
 
-def run_miniprogram_tasks(account, gap=1.0, claim=True):
+def run_miniprogram_tasks(account, gap=1.0, claim=True, tasks=None):
     """小程序链式任务自动化（Sequential_Tasks 系列与校园日活动）。
 
     参考并致谢 L0NE-6/WorkBuddy-Daily 的小程序埋点协议与任务链设计。
     """
     if account.realm != "cn" or getattr(account, "is_enterprise", lambda: False)():
         return {"ok": True, "logs": [], "earned_credit": 0}
+    if (getattr(account, "account_banned", False)
+            or not getattr(account, "task_active", lambda: True)()):
+        return {"ok": False, "logs": ["任务参与或封禁闸门阻止执行"], "earned_credit": 0}
     logs = []
-    mp_tasks = fetch_growth_tasks(account, mp=True)
+    try:
+        mp_tasks = fetch_growth_tasks(account, mp=True) if tasks is None else tasks
+    except Exception as exc:
+        return {"ok": False, "terminal": _growth_failure(str(exc), cause=exc).terminal,
+                "logs": [f"! 小程序任务查询失败: {exc}"], "earned_credit": 0}
     if not mp_tasks:
         return {"ok": True, "logs": logs, "earned_credit": 0}
 
     supported = [t for t in mp_tasks if t["task_code"] in MP_TASK_SPECS
-                 or t["task_code"].startswith("Sequential_Tasks_")]
+                 or (t["task_code"].startswith("Sequential_Tasks_")
+                     and t["task_code"] not in TASK_SPECS)]
     if not supported:
         return {"ok": True, "logs": logs, "earned_credit": 0}
 
     logs.append(f"📱 发现 {len(supported)} 个小程序成长任务，开始执行自动化...")
-    unaccepted = [t["task_code"] for t in supported if t["status"] == "not_accepted"]
-    if unaccepted:
-        acc = accept_tasks(account, unaccepted, mp=True)
+    mp_tasks = supported
+    for origin in (False, True):
+        unaccepted = [t["task_code"] for t in supported
+                      if t["status"] == "not_accepted" and bool(t.get("mp", True)) == origin]
+        if not unaccepted:
+            continue
+        acc = accept_tasks(account, unaccepted, mp=origin)
+        if acc.get("terminal"):
+            logs.append(f"! 小程序任务接取终止: {acc.get('msg') or acc.get('reasons')}")
+            return {"ok": False, "terminal": True, "logs": logs, "earned_credit": 0}
         if acc.get("accepted"):
-            logs.append(f"✓ 已接取小程序任务: {', '.join(acc['accepted'])}")
+            logs.append(f"✓ 已回读确认接取小程序任务: {', '.join(acc['accepted'])}")
         time.sleep(gap)
-        mp_tasks = fetch_growth_tasks(account, mp=True)
+        try:
+            fresh = {t["task_code"]: t for t in fetch_growth_tasks(account, mp=origin)}
+            mp_tasks = [dict(fresh[t["task_code"]], mp=origin)
+                        if bool(t.get("mp", True)) == origin and t["task_code"] in fresh else t
+                        for t in mp_tasks]
+        except Exception as exc:
+            logs.append(f"! 小程序任务接取回读失败: {exc}")
+            return {"ok": False, "terminal": _growth_failure(str(exc), cause=exc).terminal,
+                    "logs": logs, "earned_credit": 0}
 
     total_earned = 0
     now = int(time.time() * 1000)
 
     for t in mp_tasks:
         code = t["task_code"]
-        if code not in MP_TASK_SPECS and not code.startswith("Sequential_Tasks_"):
+        if code not in MP_TASK_SPECS and (not code.startswith("Sequential_Tasks_") or code in TASK_SPECS):
             continue
         status = t["status"]
         cur = t.get("current", 0)
@@ -916,10 +1121,13 @@ def run_miniprogram_tasks(account, gap=1.0, claim=True):
         if status == "claimed":
             continue
 
-        if status == "completed" or cur >= tgt:
+        if status == "completed" or (tgt > 0 and cur >= tgt):
             if claim:
-                res = claim_task(account, code, mp=True)
-                if res.get("ok"):
+                res = claim_task(account, code, mp=bool(t.get("mp", True)))
+                if res.get("terminal"):
+                    logs.append(f"! 小程序任务 [{name}] 领奖终止: {res.get('msg')}")
+                    return {"ok": False, "terminal": True, "logs": logs, "earned_credit": total_earned}
+                if res.get("ok") and res.get("reward_verified") is True:
                     cr = res.get("credit", 0)
                     total_earned += cr
                     logs.append(f"✓ 小程序任务 [{name}] 领奖成功: +{cr} 积分")
@@ -927,7 +1135,7 @@ def run_miniprogram_tasks(account, gap=1.0, claim=True):
                     logs.append(f"! 小程序任务 [{name}] 领奖失败: {res.get('msg') or '未知原因'}")
             continue
 
-        if status == "not_accepted":
+        if status not in ("accepted", "in_progress"):
             continue
 
         need = max(1, tgt - cur)
@@ -975,11 +1183,31 @@ def run_miniprogram_tasks(account, gap=1.0, claim=True):
 
         if events:
             logs.append(f"正在点亮小程序任务 [{name}] (需上报 {need} 次)...")
-            report_mp_events(account, events)
+            report = report_mp_events(account, events)
+            if isinstance(report, _GrowthProgressFailure) and report.terminal:
+                logs.append(f"! 小程序任务 [{name}] 上报终止: {report.error}")
+                return {"ok": False, "terminal": True, "logs": logs, "earned_credit": total_earned}
             time.sleep(1.5)
+            try:
+                fresh = next((x for x in fetch_growth_tasks(account, mp=bool(t.get("mp", True)))
+                              if x["task_code"] == code), None)
+            except Exception as exc:
+                logs.append(f"! 小程序任务 [{name}] 进度回读失败: {exc}")
+                return {"ok": False, "terminal": _growth_failure(str(exc), cause=exc).terminal,
+                        "logs": logs, "earned_credit": total_earned}
+            if fresh and fresh.get("status") == "claimed":
+                logs.append(f"小程序任务 [{name}] 已标记领取，未确认本次新增奖励")
+                continue
+            if not fresh or not (fresh.get("status") == "completed"
+                    or (tgt > 0 and fresh.get("current", 0) >= tgt)):
+                logs.append(f"? 小程序任务 [{name}] 进度尚未确认达标，本轮不领奖")
+                continue
             if claim:
-                res = claim_task(account, code, mp=True)
-                if res.get("ok"):
+                res = claim_task(account, code, mp=bool(t.get("mp", True)))
+                if res.get("terminal"):
+                    logs.append(f"! 小程序任务 [{name}] 领奖终止: {res.get('msg')}")
+                    return {"ok": False, "terminal": True, "logs": logs, "earned_credit": total_earned}
+                if res.get("ok") and res.get("reward_verified") is True:
                     cr = res.get("credit", 0)
                     total_earned += cr
                     logs.append(f"✓ 小程序任务 [{name}] 点亮并领奖成功: +{cr} 积分")
@@ -1005,12 +1233,21 @@ def run_growth_tasks(account, gap=1.0, claim=True):
     if getattr(account, "is_enterprise", lambda: False)():
         return {"ok": True, "msg": "企业版账号无成长体系，跳过", "logs": []}
 
+    if (getattr(account, "account_banned", False)
+            or not getattr(account, "task_active", lambda: True)()):
+        return {"ok": False, "logs": ["任务参与或封禁闸门阻止执行"], "earned_credit": 0}
     logs = []
     logs.append(f"开始为账号 {account.nickname or account.uid[:8]} 运行成长任务自动化...")
-    tasks = fetch_growth_tasks(account)
+    discovery = discover_growth_tasks(account)
+    tasks = discovery["tasks"]
+    read_errors = list(discovery["errors"])
+    if read_errors:
+        logs.extend(f"! 任务清单查询失败: {error}" for error in read_errors)
+    if discovery.get("terminal"):
+        return {"ok": False, "terminal": True, "logs": logs, "earned_credit": 0}
     if not tasks:
-        logs.append("未能获取到任务清单，请检查网络或账号状态")
-        return {"ok": False, "logs": logs, "earned_credit": 0}
+        logs.append("任务清单查询失败" if read_errors else "当前任务清单为空")
+        return {"ok": not read_errors, "logs": logs, "earned_credit": 0}
 
     total_earned = 0
 
@@ -1021,7 +1258,11 @@ def run_growth_tasks(account, gap=1.0, claim=True):
     for t in tasks:
         if (t.get("task_type") == "auto"
                 and t.get("task_code") not in NIGHT_TASK_CODES):
-            total_earned += _progress_one(account, t, logs, gap, claim=claim)
+            outcome = _progress_one(account, t, logs, gap, claim=claim)
+            total_earned += outcome
+            if getattr(outcome, "ok", True) is False:
+                return {"ok": False, "terminal": outcome.terminal, "logs": logs,
+                        "errors": [outcome.error], "earned_credit": total_earned}
 
     # 1. 批量接取未接任务（auto 类不接受接取，unforgeable 无法自动化）
     def _needs_accept(x):
@@ -1029,56 +1270,70 @@ def run_growth_tasks(account, gap=1.0, claim=True):
                 and x.get("task_type") != "auto"
                 and x.get("task_code") not in NIGHT_TASK_CODES)
 
-    unaccepted = [t["task_code"] for t in tasks if _needs_accept(t)]
-    if unaccepted:
-        logs.append(f"发现 {len(unaccepted)} 个待接取任务，正在批量接取...")
-        acc = accept_tasks(account, unaccepted)
-        if acc.get("failed"):
-            why = acc.get("msg") or ("; ".join(acc.get("reasons") or [])[:160])
-            logs.append(f"! 接取未成功 {len(acc['failed'])} 个: {', '.join(acc['failed'][:5])}"
-                        + (" ..." if len(acc["failed"]) > 5 else "")
-                        + (f" ({why})" if why else ""))
+    for mp in (False, True):
+        unaccepted = [t["task_code"] for t in tasks if _needs_accept(t)
+                      and bool(t.get("mp")) == mp
+                      and t["task_code"] not in MP_TASK_SPECS
+                      and (not t["task_code"].startswith("Sequential_Tasks_") or t["task_code"] in TASK_SPECS)]
+        if not unaccepted:
+            continue
+        acc = accept_tasks(account, unaccepted, **({"mp": True} if mp else {}))
         if acc.get("accepted"):
-            logs.append(f"✓ 已接取 {len(acc['accepted'])} 个任务")
+            logs.append(f"✓ 已回读确认接取 {len(acc['accepted'])} 个任务")
+        if acc.get("failed"):
+            logs.append(f"! 接取未确认: {', '.join(acc['failed'])} "
+                        f"{acc.get('msg') or '; '.join(acc.get('reasons') or [])}")
+        if acc.get("terminal"):
+            return {"ok": False, "terminal": True, "logs": logs, "earned_credit": total_earned}
         time.sleep(gap)
-        tasks = fetch_growth_tasks(account)
-        # 复核一次: 上游偶尔会瞬时拒绝整个批次, 复查后仍处于未接取的再补一次,
-        # 否则后面所有上报都作用在未接取的任务上 —— 进度全是 0。
-        still = [t["task_code"] for t in tasks if _needs_accept(t)]
-        if still:
-            logs.append(f"仍有 {len(still)} 个未接取，重试接取一次...")
-            retry = accept_tasks(account, still)
-            if retry.get("accepted"):
-                logs.append(f"✓ 重试接取成功 {len(retry['accepted'])} 个")
-            time.sleep(gap)
-            tasks = fetch_growth_tasks(account)
-        if not tasks:
-            logs.append("! 接取后无法获取任务清单，本轮中止")
-            return {"ok": False, "logs": logs, "earned_credit": total_earned}
-        still_pending = [t["task_code"] for t in tasks if _needs_accept(t)]
-        if still_pending:
-            logs.append(f"! 仍有 {len(still_pending)} 个任务处于未接取状态，"
-                        f"对未接取任务上报事件不会计入进度，本轮跳过这些任务")
+        try:
+            fresh = fetch_growth_tasks(account, **({"mp": True} if mp else {}))
+            # Keep the original discovery ownership; MP lists can be supersets.
+            by_code = {t["task_code"]: t for t in fresh}
+            tasks = [dict(by_code[t["task_code"]], mp=mp)
+                     if bool(t.get("mp")) == mp and t["task_code"] in by_code else t
+                     for t in tasks]
+        except Exception as exc:
+            read_errors.append(str(exc))
+            logs.append(f"! 接取后任务清单回读失败: {exc}")
+            if _growth_failure(str(exc), cause=exc).terminal:
+                return {"ok": False, "terminal": True, "logs": logs, "earned_credit": total_earned}
+            tasks = [t for t in tasks if bool(t.get("mp")) != mp]
 
     # 2. 处理每个任务（auto 已在第 0 步处理过）
     for t in tasks:
         if (t.get("task_type") == "auto"
-                or t.get("task_code") in NIGHT_TASK_CODES):
+                or t.get("task_code") in NIGHT_TASK_CODES
+                or t["task_code"] in MP_TASK_SPECS
+                or (t["task_code"].startswith("Sequential_Tasks_")
+                     and t["task_code"] not in TASK_SPECS)):
             continue
-        total_earned += _progress_one(account, t, logs, gap, claim=claim)
+        outcome = _progress_one(account, t, logs, gap, claim=claim)
+        total_earned += outcome
+        if getattr(outcome, "ok", True) is False:
+            return {"ok": False, "terminal": outcome.terminal, "logs": logs,
+                    "errors": [outcome.error], "earned_credit": total_earned}
 
     # 2b. 运行微信小程序链式成长任务（Sequential_Tasks 系列）
     try:
-        mp_res = run_miniprogram_tasks(account, gap=gap, claim=claim)
+        mp_res = run_miniprogram_tasks(account, gap=gap, claim=claim,
+            tasks=[t for t in tasks if t["task_code"] in MP_TASK_SPECS
+                   or (t["task_code"].startswith("Sequential_Tasks_")
+                     and t["task_code"] not in TASK_SPECS)])
+        if mp_res.get("ok") is False:
+            read_errors.append("小程序任务未完成")
         total_earned += mp_res.get("earned_credit", 0)
         logs.extend(mp_res.get("logs", []))
+        if mp_res.get("terminal"):
+            return {"ok": False, "terminal": True, "logs": logs, "earned_credit": total_earned}
     except Exception as exc:
+        read_errors.append(str(exc))
         logs.append(f"! 小程序成长任务执行异常: {exc}")
 
     # 3. 刷新积分余额。每日福利不在这里执行。
     account.fetch_credits()
-    logs.append(f"🎉 一次性 / 活动任务执行完毕！本次累计新增到账: +{total_earned} 积分，当前总剩余: {account.credits.get('remain', 0)} 积分")
-    return {"ok": True, "logs": logs, "earned_credit": total_earned, "credits": account.credits}
+    logs.append(f"🎉 一次性 / 活动任务执行完毕！本次奖励回执确认积分: +{total_earned} 积分，当前总剩余: {account.credits.get('remain', 0)} 积分")
+    return {"ok": not read_errors, "logs": logs, "earned_credit": total_earned, "credits": account.credits}
 
 
 def run_night_growth(account):
@@ -1088,12 +1343,18 @@ def run_night_growth(account):
         return {"ok": False, "msg": "国际版不适用国内成长任务中心", "logs": [], "earned_credit": 0}
     if getattr(account, "is_enterprise", lambda: False)():
         return {"ok": True, "msg": "企业版账号无成长体系，跳过", "logs": [], "earned_credit": 0}
+    if (getattr(account, "account_banned", False)
+            or not getattr(account, "task_active", lambda: True)()):
+        return {"ok": False, "logs": ["任务参与或封禁闸门阻止执行"], "earned_credit": 0}
     logs = []
     name = account.nickname or account.uid[:8]
     if not in_night_window():
         return {"ok": True, "earned_credit": 0, "logs": [
             f"[{name}] 当前不在 23:00-08:00 夜间窗口, 夜猫子任务跳过 (每日 01:00 自动执行)"]}
-    tasks = fetch_growth_tasks(account)
+    try:
+        tasks = fetch_growth_tasks(account)
+    except Exception as exc:
+        return {"ok": False, "earned_credit": 0, "logs": [f"[{name}] 夜猫子清单回读失败: {exc}"]}
     t = next((x for x in tasks if x["task_code"] == "black_cat"), None)
     if not t:
         return {"ok": False, "earned_credit": 0, "logs": [f"[{name}] 未获取到夜猫子任务清单"]}
@@ -1110,35 +1371,42 @@ def run_night_growth(account):
     cur, tgt = t.get("current", 0), t.get("target", 3)
     if cur >= tgt:
         res = claim_task(account, "black_cat")
-        cr = res.get("credit", 0) if res.get("ok") else 0
+        cr = res.get("credit", 0) if res.get("ok") and res.get("reward_verified") is True else 0
         account.fetch_credits()
-        logs.append(f"[{name}] 夜猫子任务达标, 领奖 {'✓ +' + str(cr) + ' 积分' if res.get('ok') else '! 失败: ' + (res.get('msg') or '')}")
-        return {"ok": res.get("ok", False), "earned_credit": cr, "logs": logs}
+        logs.append(f"[{name}] 夜猫子任务达标, 领奖 {'✓ +' + str(cr) + ' 积分' if res.get('ok') and res.get('reward_verified') is True else '! 未确认: ' + (res.get('msg') or '')}")
+        return {"ok": res.get("ok") is True and res.get("reward_verified") is True,
+                "earned_credit": cr, "logs": logs}
     ev = build_event(account, "cat", idx=0)
     ok = report_events(account, [ev])
+    if getattr(ok, "terminal", False):
+        logs.append(f"[{name}] 夜间上报遇限制，已停止: {getattr(ok, 'error', 'terminal error')}")
+        return {"ok": False, "terminal": True, "earned_credit": 0, "logs": logs}
     logs.append(f"[{name}] 上报夜间 GLM-5.2 对话事件: {'成功' if ok else '失败'} (进度 {cur}/{tgt})")
     fresh = None
     for _ in range(4):
         time.sleep(4)
-        fresh = next((x for x in fetch_growth_tasks(account) if x["task_code"] == "black_cat"), None)
+        try:
+            fresh = next((x for x in fetch_growth_tasks(account) if x["task_code"] == "black_cat"), None)
+        except Exception as exc:
+            logs.append(f"[{name}] 夜猫子进度回读失败: {exc}")
+            return {"ok": False, "earned_credit": 0, "logs": logs}
         if fresh and fresh.get("current", 0) > cur:
             break
     new_cur = fresh.get("current", cur) if fresh else cur
+    earned = 0
+    claim_ok = True
     if new_cur >= tgt:
         res = claim_task(account, "black_cat")
-        cr = res.get("credit", 0) if res.get("ok") else 0
-        logs.append(f"[{name}] 夜猫子任务完成 {new_cur}/{tgt}, 领奖 {'✓ +' + str(cr) + ' 积分' if res.get('ok') else '! 失败: ' + (res.get('msg') or '')}")
+        cr = res.get("credit", 0) if res.get("ok") and res.get("reward_verified") is True else 0
+        earned = cr
+        claim_ok = res.get("ok") is True and res.get("reward_verified") is True
+        logs.append(f"[{name}] 夜猫子任务完成 {new_cur}/{tgt}, 领奖 {'✓ +' + str(cr) + ' 积分' if res.get('ok') and res.get('reward_verified') is True else '! 未确认: ' + (res.get('msg') or '')}")
     elif new_cur > cur:
         logs.append(f"[{name}] 今晚 +1 ({new_cur}/{tgt}), 明晚继续, 累计 3 天可领奖")
     else:
         logs.append(f"[{name}] 已上报但进度暂未变化 ({new_cur}/{tgt}), 明晚调度器会继续累计")
     account.fetch_credits()
-    earned = 0
-    for line in logs:
-        m = re.search(r"\+(\d+) 积分", line)
-        if m:
-            earned = int(m.group(1))
-    return {"ok": True, "earned_credit": earned, "logs": logs}
+    return {"ok": claim_ok, "earned_credit": earned, "logs": logs}
 
 def run_streak_bonus(account):
     """连登管家：补签保连登 -> 礼包/补偿 -> 连登档位兑换 (7d/14d/28d) -> 自动抽奖闭环。

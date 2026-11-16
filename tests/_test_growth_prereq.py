@@ -77,7 +77,7 @@ class GrowthPrereqTests(unittest.TestCase):
          T.run_miniprogram_tasks) = self._orig
 
     def _stub(self):
-        def fetch(acc):
+        def fetch(acc, mp=False):
             fb_status = {0: "not_accepted", 1: "completed", 2: "claimed"}[self.state["fb"]]
             fb = _task("first_buddy", status=fb_status, current=min(self.state["fb"], 1),
                        target=1, task_type="auto")
@@ -97,7 +97,7 @@ class GrowthPrereqTests(unittest.TestCase):
             self.events.append(("claim", code))
             if code == "first_buddy":
                 self.state["fb"] = 2
-            return {"ok": True, "credit": 300 if code == "first_buddy" else 100}
+            return {"ok": True, "reward_verified": True, "credit": 300 if code == "first_buddy" else 100}
         T.claim_task = claim
 
         def accept(acc, codes, chunk=20):
@@ -138,7 +138,7 @@ class GrowthPrereqTests(unittest.TestCase):
         T.do_buddy_open = lambda acc: (daily_calls.append("buddy")
                                        or {"ok": True, "action": "open",
                                            "msg": "opened"})
-        T.run_miniprogram_tasks = lambda acc, gap=1.0, claim=True: {
+        T.run_miniprogram_tasks = lambda acc, gap=1.0, claim=True, tasks=None: {
             "ok": True, "logs": [], "earned_credit": 0}
         res = T.run_growth_tasks(FakeAccount(), gap=0)
         self.assertTrue(res["ok"], res)
@@ -147,7 +147,7 @@ class GrowthPrereqTests(unittest.TestCase):
     def test_growth_run_skips_night_task(self):
         self._stub()
 
-        def fetch(acc):
+        def fetch(acc, mp=False):
             return [
                 _task("first_buddy", status="claimed", current=1, target=1,
                       task_type="auto"),
@@ -158,7 +158,7 @@ class GrowthPrereqTests(unittest.TestCase):
         T.fetch_growth_tasks = fetch
         events = []
         T.report_events = lambda acc, evs, base=None: (events.extend(evs), True)[1]
-        T.run_miniprogram_tasks = lambda acc, gap=1.0, claim=True: {
+        T.run_miniprogram_tasks = lambda acc, gap=1.0, claim=True, tasks=None: {
             "ok": True, "logs": [], "earned_credit": 0}
         res = T.run_growth_tasks(FakeAccount(), gap=0)
         self.assertTrue(res["ok"], res)
@@ -197,7 +197,7 @@ class GrowthPrereqTests(unittest.TestCase):
         calls = []
         state = {"fb": "not_accepted", "departs": 0}
 
-        def fetch(acc):
+        def fetch(acc, mp=False):
             return [_task("first_buddy", status=state["fb"],
                           current=1 if state["fb"] != "not_accepted" else 0,
                           target=1, task_type="auto")]
@@ -212,7 +212,7 @@ class GrowthPrereqTests(unittest.TestCase):
         def claim(acc, code):
             calls.append("claim:" + code)
             state["fb"] = "claimed"
-            return {"ok": True, "credit": 300}
+            return {"ok": True, "reward_verified": True, "credit": 300}
         T.claim_task = claim
 
         def fake_urlopen(req, timeout=10, proxy=""):
@@ -267,7 +267,7 @@ class GrowthPrereqTests(unittest.TestCase):
         calls = []
         state = {"cur": 0}
 
-        def fetch(acc):
+        def fetch(acc, mp=False):
             if state["cur"]:
                 return [_task("black_cat", status="completed", current=3, target=3)]
             return [_task("black_cat", status="not_accepted", current=0, target=3)]
@@ -287,7 +287,7 @@ class GrowthPrereqTests(unittest.TestCase):
 
         def claim(acc, code):
             calls.append(("claim", code))
-            return {"ok": True, "credit": 100}
+            return {"ok": True, "reward_verified": True, "credit": 100}
         T.claim_task = claim
 
         orig_night = T.in_night_window
@@ -319,7 +319,7 @@ class GrowthPrereqTests(unittest.TestCase):
         events = []
         state = {"completed": False}
 
-        def fetch(acc):
+        def fetch(acc, mp=False):
             status = "completed" if state["completed"] else "accepted"
             return [_task("WorkBuddy_Valorant", status=status,
                           current=1 if state["completed"] else 0, target=1)]
@@ -332,7 +332,7 @@ class GrowthPrereqTests(unittest.TestCase):
         original = (T.fetch_growth_tasks, T.report_events, T.claim_task)
         T.fetch_growth_tasks = fetch
         T.report_events = report
-        T.claim_task = lambda acc, code: {"ok": True, "credit": 100}
+        T.claim_task = lambda acc, code: {"ok": True, "reward_verified": True, "credit": 100}
         try:
             earned = T._progress_one(
                 FakeAccount(), _task("WorkBuddy_Valorant", status="accepted"), [], 0)
@@ -370,7 +370,7 @@ class GrowthPrereqTests(unittest.TestCase):
         original = (T.fetch_growth_tasks, T.report_events, T.claim_task)
         T.fetch_growth_tasks = lambda acc: [dict(task, status="completed", current=1)]
         T.report_events = lambda acc, evs, base=None: (events.extend(evs), True)[1]
-        T.claim_task = lambda acc, code: {"ok": True, "credit": 100}
+        T.claim_task = lambda acc, code: {"ok": True, "reward_verified": True, "credit": 100}
         try:
             earned = T._progress_one(FakeAccount(), task, [], 0)
         finally:
@@ -435,7 +435,7 @@ class GrowthPrereqTests(unittest.TestCase):
             return True
         def fake_claim(acc, code, mp=False):
             calls.append(("claim", code, mp))
-            return {"ok": True, "credit": 100}
+            return {"ok": True, "reward_verified": True, "credit": 100}
 
         orig = (T.fetch_growth_tasks, T.accept_tasks, T.report_mp_events, T.claim_task)
         T.fetch_growth_tasks = fake_fetch

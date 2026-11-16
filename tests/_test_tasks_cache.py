@@ -86,7 +86,8 @@ class FakeUpstream(object):
 
     def tasks(self, acc):
         self.reads.append(("tasks", acc.uid))
-        return {"kind": "tasks", "uid": acc.uid, "epoch": self.epoch}
+        return {"ok": True, "tasks": [{"task_code": "first_buddy", "mp": False}],
+                "errors": [], "kind": "tasks", "uid": acc.uid, "epoch": self.epoch}
 
     def summary(self, acc):
         self.reads.append(("summary", acc.uid))
@@ -125,24 +126,24 @@ def capturing_handler():
 class TasksCacheTests(unittest.TestCase):
     def setUp(self):
         self.calls = []
-        self._orig = (T.fetch_growth_tasks, T.fetch_growth_summary)
+        self._orig = (T.discover_growth_tasks, T.fetch_growth_summary)
         self._ttl = P.TASKS_CACHE_TTL
 
         def tasks(acc):
             self.calls.append(("tasks", acc.uid))
-            return {"tasks": [], "for": acc.uid}
+            return {"ok": True, "tasks": [], "errors": [], "for": acc.uid}
 
         def summary(acc):
             self.calls.append(("summary", acc.uid))
             return {"summary": {}, "for": acc.uid}
 
         self._stub = tasks
-        T.fetch_growth_tasks = tasks
+        T.discover_growth_tasks = tasks
         T.fetch_growth_summary = summary
         P.invalidate_tasks_cache()
 
     def tearDown(self):
-        T.fetch_growth_tasks, T.fetch_growth_summary = self._orig
+        T.discover_growth_tasks, T.fetch_growth_summary = self._orig
         P.TASKS_CACHE_TTL = self._ttl
         P.invalidate_tasks_cache()
 
@@ -186,10 +187,10 @@ class TasksCacheTests(unittest.TestCase):
 
     def test_failure_is_not_cached(self):
         acc = StubAccount("uid-a")
-        T.fetch_growth_tasks = lambda a: (_ for _ in ()).throw(RuntimeError("upstream down"))
+        T.discover_growth_tasks = lambda a: (_ for _ in ()).throw(RuntimeError("upstream down"))
         with self.assertRaises(RuntimeError):
             P.growth_snapshot(acc)
-        T.fetch_growth_tasks = self._stub
+        T.discover_growth_tasks = self._stub
         P.growth_snapshot(acc)
         self.assertTrue(self.calls, "失败不该被缓存成快照")
 
@@ -204,10 +205,10 @@ class ActionInvalidationTests(unittest.TestCase):
 
     def setUp(self):
         self.upstream = FakeUpstream()
-        self._orig = (T.fetch_growth_tasks, T.fetch_growth_summary,
+        self._orig = (T.discover_growth_tasks, T.fetch_growth_summary,
                       T.run_growth_tasks, T.do_cat_travel, T.run_night_growth)
         self._ttl = P.TASKS_CACHE_TTL
-        T.fetch_growth_tasks = self.upstream.tasks
+        T.discover_growth_tasks = self.upstream.tasks
         T.fetch_growth_summary = self.upstream.summary
         T.run_growth_tasks = self.upstream.run_tasks
         T.do_cat_travel = self.upstream.travel
@@ -218,7 +219,7 @@ class ActionInvalidationTests(unittest.TestCase):
         P.invalidate_tasks_cache()
 
     def tearDown(self):
-        (T.fetch_growth_tasks, T.fetch_growth_summary,
+        (T.discover_growth_tasks, T.fetch_growth_summary,
          T.run_growth_tasks, T.do_cat_travel, T.run_night_growth) = self._orig
         P.TASKS_CACHE_TTL = self._ttl
         P.POOL = self._pool
@@ -283,8 +284,8 @@ class ActionInvalidationTests(unittest.TestCase):
         self.upstream.bump()
         calls = []
         orig = T.claim_task
-        T.claim_task = lambda acc, code: (calls.append((acc.uid, code)) or
-                                          {"ok": True, "credit": 12})
+        T.claim_task = lambda acc, code, mp=False: (calls.append((acc.uid, code)) or
+                                          {"ok": True, "reward_verified": True, "credit": 12})
         try:
             response = self.drive("/tasks/claim",
                                   {"uid": "uid-a", "code": "first_buddy"})
@@ -292,6 +293,7 @@ class ActionInvalidationTests(unittest.TestCase):
             T.claim_task = orig
         self.assertTrue(response.get("ok"), response)
         self.assertEqual(calls, [("uid-a", "first_buddy")])
+        self.reads_after_warm += 1  # live origin discovery before claim
         self.assert_refetched(warm, "/tasks/claim")
 
     def test_task_claim_requires_a_single_account(self):
