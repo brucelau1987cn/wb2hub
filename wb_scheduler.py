@@ -26,6 +26,8 @@ DAILY_CHAT_BATCH_SLACK = 60
 #: 都有 20~30 秒超时），留上限是为了「上游一直滴数据 / DNS 卡住」这种病态情况：
 #: 到了上限就不再开新的工作线程，宁可这一轮跳过账号，也不让线程无限堆。
 DAILY_CHAT_ABANDONED_MAX = 8
+# Retry only explicit processing/transient failures, twice per account/day.
+CHECKIN_RETRY_DELAYS = (600, 1800)
 
 
 def _proxy_module():
@@ -118,6 +120,7 @@ class Scheduler:
         # 启动后第一次巡检要补跑当天还没活跃的国际版账号：进程在时段内停过
         # （或调度线程被卡住）时，旧实现只能等下一个时段，最多再等 12 小时。
         self._catchup_pending = True
+        self._checkin_retries = {}
         # 每日活跃总开关关闭的提示每次关闭只打一条日志，避免每个时段刷屏。
         self._daily_activity_notice = False
         self.all_hours = sorted(list(set(self.checkin_hours + self.travel_hours + self.keepalive_hours + self.cat_hours)))
@@ -185,6 +188,7 @@ class Scheduler:
         self._run_window_probes()
 
         while not self._stop_event.is_set():
+            self._run_checkin_retries()
             self._reload_schedule()
             self._calc_next_fire()
             if (self.enabled
@@ -224,6 +228,71 @@ class Scheduler:
             # 已经打满」的唯一主动信息源，跟签到/保活不是一回事。
             self._run_quota_scans()
             self._stop_event.wait(self._next_wait())
+
+    def _queue_checkin_retry(self, account, result, attempt=0):
+        """Queue only confirmed pending/transient CN failures; never retry true rate limits."""
+        if (getattr(account, "realm", None) != "cn" or result.get("ok")
+                or result.get("restricted")
+                or not (result.get("state") == "pending" or result.get("retryable") is True)
+                or attempt >= len(CHECKIN_RETRY_DELAYS)):
+            return False
+        key = (time.strftime("%Y-%m-%d"), account.uid)
+        pending = self._checkin_retries.get(key)
+        if pending and not pending.get("finished"):
+            return True
+        if pending and pending.get("finished"):
+            return False
+        self._checkin_retries[key] = {
+            "due": time.time() + CHECKIN_RETRY_DELAYS[attempt], "attempt": attempt,
+            "finished": False,
+        }
+        self.log("国内签到 [%s] 已安排有限补签（第 %d 次）" % (account.uid[:8], attempt + 1))
+        return True
+
+    def _run_checkin_retries(self):
+        """Use the normal cycle lock and live account state; do not bypass restrictions."""
+        if not self.enabled or self._stop_event.is_set():
+            return
+        if not self._run_lock.acquire(blocking=False):
+            return
+        try:
+            today = time.strftime("%Y-%m-%d")
+            for key, item in list(self._checkin_retries.items()):
+                if key[0] != today:
+                    self._checkin_retries.pop(key, None)
+                    continue
+                if item.get("finished") or item["due"] > time.time():
+                    continue
+                account = next((a for a in self.pool.accounts if a.uid == key[1]), None)
+                if (account is None or account.realm != "cn"
+                        or getattr(account, "account_banned", False)
+                        or not account.task_active() or not account.can_checkin()):
+                    item["finished"] = True
+                    continue
+                try:
+                    hold = _proxy_module().restriction_hold_remaining(account.realm)
+                except Exception:
+                    # Fail closed: a failed governance check must not trigger an auth probe.
+                    continue
+                if hold > 0 or getattr(account, "restricted_until", 0) > time.time():
+                    continue
+                # Reserve this attempt before I/O: an exception must not trigger a retry storm.
+                item["finished"] = True
+                try:
+                    result = account.checkin(trigger="scheduler")
+                except Exception as exc:
+                    self.log("国内补签 [%s] 执行异常：%s" % (account.uid[:8], exc))
+                    continue
+                self.log("国内补签 [%s]：%s" % (
+                    account.uid[:8], result.get("msg") or result.get("error") or "未知结果"))
+                next_attempt = item["attempt"] + 1
+                if (not result.get("ok") and not result.get("restricted")
+                        and (result.get("state") == "pending" or result.get("retryable") is True)
+                        and next_attempt < len(CHECKIN_RETRY_DELAYS)):
+                    item.update(due=time.time() + CHECKIN_RETRY_DELAYS[next_attempt],
+                                attempt=next_attempt, finished=False)
+        finally:
+            self._run_lock.release()
 
     def _run_window_probes(self):
         """在独立线程里执行到点的窗口探针。
@@ -494,6 +563,7 @@ class Scheduler:
                             self.log(f"✓ 账号 [{uid8}] 自动签到成功: {res.get('msg')}")
                         else:
                             self.log(f"! 账号 [{uid8}] 自动签到未成功: {res.get('error') or res.get('msg')}")
+                            self._queue_checkin_retry(acc, res)
                         time.sleep(1.0)
 
                     if acc.can_report_activity():

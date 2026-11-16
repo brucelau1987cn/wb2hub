@@ -10938,6 +10938,17 @@ function activityStatusOf(a){
     const label = '今日活跃';
     const done = a && a.lastDailyChat;
     const event = ACTIVITY_TODAY.byUid[uid];
+    const evidence = a && a.dailyChatState;
+    if(evidence && evidence.date === todayStamp()){
+      const verified = evidence.activityVerified === true;
+      const webDone = evidence.webCompleted === true;
+      const reward = evidence.rewardVerified === true ? '奖励已核验' : '奖励未核验';
+      return {kind: webDone ? 'done' : 'none', label: label,
+              state: webDone ? '网页已完成' : '网页待完成',
+              at: event ? String(event.ts || '').replace('T', ' ').slice(0, 19) : '',
+              message: (verified ? '连登已核验' : '连登未核验') + '；' + reward
+                       + (event && event.message ? '；' + event.message : '')};
+    }
     if(event){
       return {kind: event.ok ? 'ok' : 'failed', label: label,
               state: event.ok ? '成功' : '失败',

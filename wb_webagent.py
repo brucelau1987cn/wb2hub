@@ -207,15 +207,34 @@ def _set_model(channel, session_id, model, log):
     modelId})）。少了它，会话跑的是账号的默认模型——网页端默认是 Auto，按付费
     模型计费，于是每天的活跃都在扣积分。
 
-    失败不当致命错：这一轮还是要跑完，只是模型可能没切成，日志里留一句。
+    切换失败或未获 RPC 确认时中止，避免静默使用付费默认模型。
+    等待时保留其它事件（包括权限/工具事件），不吞掉它们。
     """
+    deferred = []
     try:
         channel.request("session/set_model",
                         {"sessionId": session_id, "modelId": model}, 3)
-        return True
+        deadline = time.monotonic() + min(10, max(1, getattr(channel, "timeout", 10)))
+        while time.monotonic() < deadline:
+            try:
+                message = channel.events.get(timeout=max(0.001, deadline - time.monotonic()))
+            except queue.Empty:
+                break
+            if isinstance(message, dict) and message.get("id") == 3:
+                if message.get("error"):
+                    raise AcpError(str(message["error"]))
+                if "result" in message:
+                    return True
+            deferred.append(message)
+            if message is None:
+                break
+        raise AcpError("未收到 session/set_model 确认")
     except Exception as exc:
-        log("web agent: 设置模型 %s 失败 (%s)，本轮仍按会话默认模型跑" % (model, exc))
+        log("web agent: 设置模型 %s 失败 (%s)，已中止以避免默认模型计费" % (model, exc))
         return False
+    finally:
+        for message in deferred:
+            channel.events.put(message)
 
 
 def run_turn(link, token, session_id, cwd, prompt, user_agent, poll_status=None,
@@ -243,8 +262,8 @@ def run_turn(link, token, session_id, cwd, prompt, user_agent, poll_status=None,
         channel.request("session/load",
                         {"sessionId": session_id, "cwd": cwd or "/workspace",
                          "mcpServers": []}, 2)
-        if model:
-            _set_model(channel, session_id, model, log)
+        if model and not _set_model(channel, session_id, model, log):
+            raise AcpError("设置模型 %s 失败或未获确认；已中止，未使用默认模型" % model)
         channel.request("session/prompt",
                         {"sessionId": session_id,
                          "prompt": [{"type": "text", "text": prompt}]}, 4)

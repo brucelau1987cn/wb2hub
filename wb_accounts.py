@@ -465,8 +465,9 @@ USER_AGENT = REALM_CONFIGS['intl']['chat_ua']
 #: code == 10001` 一律当成功，把「请求处理中，请勿重复操作」这种明确没签成
 #: 的回执也记成了成功（实测一轮 27 个账号里 4 条，当天真签成 8 个）。
 CHECKIN_PENDING_HINTS = ("处理中", "请勿重复操作", "系统繁忙", "稍后再试")
-CHECKIN_ALREADY_HINTS = ("已签到",)
-CHECKIN_FAILURE_HINTS = ("失败",)
+CHECKIN_ALREADY_HINTS = ("已签到", "重复签到", "already checked in", "already check-in",
+                         "already signed in")
+CHECKIN_FAILURE_HINTS = ("失败", "fail", "not started", "未开启", "不支持")
 
 
 def checkin_state(code, msg):
@@ -476,16 +477,48 @@ def checkin_state(code, msg):
     先写盘）会让当天 can_checkin() 恒为 False，这次失败被永久放弃，9 点与
     21 点两轮再也不会重试，面板还显示「今日已领」。
     """
-    text = str(msg or "")
+    text = str(msg or "").lower()
+    if code in (11140, 14003, 6004, 6005, 401, 403, 429):
+        return "failed"
+    if any(k in text for k in CHECKIN_FAILURE_HINTS):
+        return "failed"
     if any(k in text for k in CHECKIN_PENDING_HINTS):
         return "pending"
-    if code == 0:
-        # 「失败」是唯一的硬词：CHECKIN_FAILURE_HINTS 之外的口径太宽，
-        # 「签到成功，距离 7 天奖励还不足」里的「不足」会把成功判成失败。
-        return "failed" if any(k in text for k in CHECKIN_FAILURE_HINTS) else "checked"
-    if code == 10001:
-        return "already" if any(k in text for k in CHECKIN_ALREADY_HINTS) else "failed"
-    return "failed"
+    if code in (0, 10001) and any(k in text for k in CHECKIN_ALREADY_HINTS):
+        return "already"
+    return "checked" if code == 0 else "failed"
+
+
+def _checkin_receipt(payload):
+    """Keep upstream reward evidence separate from successful daily bookkeeping."""
+    if not isinstance(payload, dict):
+        return {"ok": False, "state": "failed", "error": "invalid checkin response",
+                "credit_known": False, "retryable": False}
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else payload
+    # Only the documented flat receipt may omit the envelope code.
+    flat_credit = payload.get("credit")
+    flat_streak = payload.get("streak_days")
+    flat = "code" not in payload and (
+        (isinstance(flat_credit, (int, float)) and not isinstance(flat_credit, bool)
+         and math.isfinite(flat_credit) and flat_credit >= 0)
+        or (isinstance(flat_streak, int) and not isinstance(flat_streak, bool) and flat_streak >= 0))
+    code = payload.get("code", 0 if flat else -1)
+    msg = payload.get("msg") or payload.get("message") or "ok"
+    state = checkin_state(code, msg)
+    result = {"ok": state in ("checked", "already"), "state": state,
+              "code": code, "msg": msg, "data": data, "credit_known": False,
+              "retryable": False}
+    if not result["ok"]:
+        result["error"] = msg
+    if state == "checked":
+        credit = data.get("credit")
+        if (isinstance(credit, (int, float)) and not isinstance(credit, bool)
+                and math.isfinite(credit) and credit >= 0):
+            result.update(credit=credit, credit_known=True)
+    streak = data.get("streak_days")
+    if result["ok"] and isinstance(streak, int) and not isinstance(streak, bool) and streak >= 0:
+        result["streak_days"] = streak
+    return result
 
 
 #: 国际版桌面端的版本号。以前这里硬编码 5.5.2，和 wb_identity 的
@@ -877,6 +910,61 @@ def _nested_error_code(value):
     return None
 
 
+def restriction_is_account_level(code, detail):
+    """11140 is ambiguous: permanently disable only with account-ban semantics.
+
+    ``code`` may be the HTTP status or business code. JSON error/displayMsg
+    fields are decoded before matching, including escaped Chinese messages.
+    A generic request/content/model rejection is never sufficient evidence.
+    """
+    try:
+        payload = detail if isinstance(detail, dict) else json.loads(str(detail or ""))
+    except (ValueError, TypeError):
+        payload = None
+    if str(code) != "11140" and _nested_error_code(payload) != 11140:
+        return False
+
+    def messages(value):
+        if not isinstance(value, dict):
+            return []
+        found = [str(value[k]) for k in ("msg", "message", "displayMsg", "display_msg")
+                 if isinstance(value.get(k), str)]
+        for key in ("error", "data", "detail", "displayMsg", "display_msg"):
+            child = value.get(key)
+            if key in ("displayMsg", "display_msg") and isinstance(child, dict):
+                found.extend(v for v in child.values() if isinstance(v, str))
+            else:
+                found.extend(messages(child) if isinstance(child, dict) else
+                             [child] if isinstance(child, str) else [])
+        return found
+
+    texts = messages(payload) if isinstance(payload, dict) else [str(detail or "")]
+    for text in texts:
+        lower = text.lower()
+        if re.search(r"\baccount\s+(?:(?:has been|is|was)\s+)?(?:restricted|banned|suspended|blocked)\b", lower):
+            return True
+        if re.search(r"(?:账号|账户)(?:存在异常行为[，,：:\s]*)?(?:已被|已|被)(?:限制使用|封禁|禁用|冻结)", text):
+            return True
+    return False
+
+
+def model_busy_is_transient(detail):
+    """Positive model-capacity evidence only; genuine rate/quota wins conflicts."""
+    try:
+        payload = detail if isinstance(detail, dict) else json.loads(str(detail or ""))
+    except (ValueError, TypeError):
+        payload = None
+    text = (json.dumps(payload, ensure_ascii=False) if payload is not None
+            else str(detail or "")).lower()
+    if _nested_error_code(payload) in (6004, 14003, 11140):
+        return False
+    if any(word in text for word in ("rate limit", "frequency limit", "too many requests",
+                                    "quota", "credit", "限流", "频率", "额度", "积分")):
+        return False
+    return bool(re.search(r"\bmodel\s+(?:is\s+)?(?:busy|overloaded)\b", text)
+                or "模型繁忙" in text or "模型拥堵" in text)
+
+
 def _daily_chat_model_fallback_allowed(status, detail):
     """Whether a failed daily-activity desktop request should try the next model.
 
@@ -1176,6 +1264,8 @@ class Account(object):
         self.is_paid_user = paid
         self.last_checkin = data.get("lastCheckin") or None
         self.last_daily_chat = data.get("lastDailyChat") or None
+        self.daily_chat_state = (dict(data["dailyChatState"])
+                                 if isinstance(data.get("dailyChatState"), dict) else {})
         # 国内版每天一次的「对话活跃上报」（点亮官方 growth 连登/热力墙）上次
         # 成功的时刻；与 lastCheckin 同款：只按「今天成功过没有」做闸门。
         self.last_activity_report = data.get("lastActivityReport") or None
@@ -1308,6 +1398,7 @@ class Account(object):
             "tier": self.tier,
             "lastCheckin": self.last_checkin,
             "lastDailyChat": self.last_daily_chat,
+            "dailyChatState": dict(self.daily_chat_state),
             "lastActivityReport": self.last_activity_report,
             # 持久化：6004 的恢复时间是上游给的事实，重启后仍然成立（见 __init__）。
             "modelCaps": {mid: dict(entry) for mid, entry in self.model_caps.items()},
@@ -1430,6 +1521,7 @@ class Account(object):
                                  else None),
             "lastCheckin": self.last_checkin,
             "lastDailyChat": self.last_daily_chat,
+            "dailyChatState": dict(self.daily_chat_state),
             "lastActivityReport": self.last_activity_report,
             "canCheckin": self.realm == "cn" and not self.uses_enterprise_billing(),
             "canDailyChat": self.realm == "intl",
@@ -2338,17 +2430,18 @@ class Account(object):
         today_str = time.strftime("%Y-%m-%d")
         return not str(self.last_checkin).startswith(today_str)
 
-    def can_daily_chat(self):
-        if self.realm != "intl":
+    def can_daily_chat(self, web=None):
+        if self.realm != "intl" or self.account_banned:
             return False
-        # 403 / code 11140 是持久封禁；在操作者手动启用前，定时活跃不再
-        # 探测该账号。
-        if self.account_banned:
-            return False
-        if not self.last_daily_chat:
-            return True
-        today_str = time.strftime("%Y-%m-%d")
-        return not str(self.last_daily_chat).startswith(today_str)
+        if web is None:
+            web = bool(self.path) and wb_settings.daily_chat_web(os.path.dirname(self.path))
+        state = getattr(self, "daily_chat_state", {})
+        today = time.strftime("%Y-%m-%d")
+        if state.get("date") == today:
+            return not bool(state.get("webCompleted") if web else state.get("desktopCompleted"))
+        # Legacy lastDailyChat mixed fallback with real web completions. It may
+        # suppress a desktop-only run, never establish an unverified web success.
+        return bool(web) or not str(self.last_daily_chat or "").startswith(today)
 
     def can_report_activity(self):
         """每天一次的对话活跃上报（点亮 growth 连登）是否还没做过。
@@ -2475,10 +2568,27 @@ class Account(object):
             return {"ok": False, "error": "web daily chat is only for international accounts"}
         # 当日已经成功过一次就不再开新会话：多个定时点、手动触发与并发调度
         # 可能在同一账号上重叠，重复跑只会多消耗一次网页活跃额度。
-        if not self.can_daily_chat():
-            return {"ok": True, "skipped": True,
-                    "msg": "今日活跃已完成，跳过网页活跃"}
+        if self.account_banned:
+            return {"ok": False, "skipped": True, "restricted": True,
+                    "error": "账号已被上游封禁，需手动重新启用"}
+        if not self.can_daily_chat(web=True):
+            return {"ok": True, "skipped": True, "webCompleted": True,
+                    "activityVerified": self.daily_chat_state.get("activityVerified"),
+                    "rewardVerified": self.daily_chat_state.get("rewardVerified"),
+                    "msg": "今日网页会话已完成，跳过网页活跃"}
         res = self._daily_chat_web_upstream(prompt)
+        today = time.strftime("%Y-%m-%d")
+        state = dict(self.daily_chat_state) if self.daily_chat_state.get("date") == today else {
+            "date": today, "activityVerified": None, "webCompleted": False,
+            "rewardVerified": None, "desktopCompleted": False}
+        state["webCompleted"] = bool(res.get("ok"))
+        self.daily_chat_state = state
+        if res.get("ok"):
+            self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
+        res.update({key: state[key] for key in
+                    ("activityVerified", "webCompleted", "rewardVerified")})
         wb_activity.record_attempt(self, wb_activity.TASK_DAILY_CHAT, trigger, res)
         return res
 
@@ -2934,11 +3044,13 @@ class Account(object):
         if self.account_banned:
             return {"ok": False, "skipped": True, "restricted": True,
                     "error": "账号已被上游封禁，需手动重新启用"}
-        # 当日活跃成功后再触发（下一个定时点、手动补跑、并发重复调度）直接
-        # 跳过，连桌面腿也不发：这一天的 30/50 积分已经拿到了。
-        if not self.can_daily_chat():
+        # 只跳过已经完成的所选通道；通道完成本身不是奖励积分到账证据。
+        if not self.can_daily_chat(web=web):
             return {"ok": True, "skipped": True,
-                    "msg": "今日活跃已完成，跳过本轮"}
+                    "activityVerified": self.daily_chat_state.get("activityVerified"),
+                    "webCompleted": self.daily_chat_state.get("webCompleted", False),
+                    "rewardVerified": self.daily_chat_state.get("rewardVerified"),
+                    "msg": "今日所选通道已完成，跳过本轮（奖励未据此确认）"}
         res = self._daily_chat_upstream(web)
         wb_activity.record_attempt(self, wb_activity.TASK_DAILY_CHAT, trigger, res)
         return res
@@ -3023,17 +3135,8 @@ class Account(object):
                 err = exc.read().decode("utf-8", "replace")
             except Exception:
                 err = str(exc)
-            # Normal chat already treats 403/code 11140 as a persistent
-            # account ban. Daily activity used to bypass that path and therefore
-            # retried the same banned account at later scheduler slots. Mirror
-            # the existing governance here.
-            upstream_code = None
-            try:
-                body = json.loads(err or "{}")
-                upstream_code = body.get("code") if isinstance(body, dict) else None
-            except Exception:
-                pass
-            if exc.code == 403 and upstream_code == 11140:
+            # Use the same corroborated predicate as normal chat dispatch.
+            if restriction_is_account_level(exc.code, err):
                 self.note_restricted(detail=err)
                 if self.path and os.path.exists(os.path.dirname(self.path)):
                     self.save(os.path.dirname(self.path))
@@ -3081,11 +3184,18 @@ class Account(object):
         if web is None:
             web = bool(self.path) and wb_settings.daily_chat_web(
                 os.path.dirname(self.path))
+        today = time.strftime("%Y-%m-%d")
+        previous = getattr(self, "daily_chat_state", {})
+        state = dict(previous) if previous.get("date") == today else {
+            "date": today, "activityVerified": None, "webCompleted": False,
+            "rewardVerified": None, "desktopCompleted": False}
+        state["desktopCompleted"] = bool(result.get("ok"))
         web_ok = True
         if web:
             res = self.daily_chat_web(trigger=None)
             result["web"] = res
             web_ok = bool(res.get("ok"))
+            state["webCompleted"] = web_ok
             if web_ok:
                 tries = res.get("attempts") or 1
                 retried = "（重试 %d 次后）" % (tries - 1) if tries > 1 else ""
@@ -3113,17 +3223,20 @@ class Account(object):
                     fb = self._daily_activity_verified_fallback()
                     result["web_fallback"] = fb
                     if fb.get("ok"):
-                        web_ok = True
+                        state["activityVerified"] = True
                         result["ok"] = True
                         result.pop("error", None)
                         reason = "建会话缺少上游密钥" if web_key_missing else "证书校验失败"
                         result["msg"] = (
                             "连登活跃已核验；网页会话未完成（%s），不据此确认奖励积分：%s"
                             % (reason, fb.get("msg") or ""))
+        self.daily_chat_state = state
+        result.update({key: state[key] for key in
+                       ("activityVerified", "webCompleted", "rewardVerified")})
         if web_ok:
             self.last_daily_chat = time.strftime("%Y-%m-%d %H:%M:%S")
-            if self.path and os.path.exists(os.path.dirname(self.path)):
-                self.save(os.path.dirname(self.path))
+        if self.path and os.path.exists(os.path.dirname(self.path)):
+            self.save(os.path.dirname(self.path))
         return result
 
     def checkin(self, trigger="unknown"):
@@ -3150,36 +3263,39 @@ class Account(object):
         try:
             payload = http_json(url, data=b"{}", method="POST", headers=headers, timeout=15,
                                 proxy=self.proxy)
-            code = payload.get("code", -1)
-            msg = payload.get("msg") or "ok"
-            state = checkin_state(code, msg)
-            if state in ("checked", "already"):
+            result = _checkin_receipt(payload)
+            if result["ok"]:
                 self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
                 if self.path and os.path.exists(os.path.dirname(self.path)):
                     self.save(os.path.dirname(self.path))
-                return {"ok": True, "state": state, "code": code, "msg": msg,
-                        "data": payload.get("data")}
-            return {"ok": False, "state": state, "code": code, "msg": msg, "error": msg}
+            return result
         except urllib.error.HTTPError as exc:
             try:
-                raw_b = exc.read().decode("utf-8") or "{}"
-                body = json.loads(raw_b)
-                code = body.get("code")
-                msg = body.get("msg") or ("HTTP %d" % exc.code)
-                # 上游如果在今日已签到时返回 HTTP 400 且文案写「今天已签到」，
-                # 说明今日事实上已处于签到完成状态，按成功处理并记录时间。
-                state = checkin_state(code, msg)
-                if state == "already":
-                    self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
-                    if self.path and os.path.exists(os.path.dirname(self.path)):
-                        self.save(os.path.dirname(self.path))
-                    return {"ok": True, "state": state, "code": code, "msg": msg,
-                            "data": body.get("data")}
-                return {"ok": False, "state": state, "code": code, "msg": msg, "error": msg}
-            except Exception:
-                return {"ok": False, "error": "HTTP %d" % exc.code}
+                body = json.loads(exc.read().decode("utf-8", "replace") or "{}")
+                result = _checkin_receipt(body)
+            except (ValueError, OSError):
+                result = {"ok": False, "state": "failed", "credit_known": False,
+                          "error": "HTTP %d" % exc.code}
+            # A 4xx/5xx is not a successful grant. Only an explicit already
+            # receipt on HTTP 400 can reconcile today's completed checkin.
+            if exc.code == 400 and result.get("state") == "already":
+                self.last_checkin = time.strftime("%Y-%m-%d %H:%M:%S")
+                if self.path and os.path.exists(os.path.dirname(self.path)):
+                    self.save(os.path.dirname(self.path))
+            else:
+                state = "pending" if exc.code == 400 and result.get("state") == "pending" else "failed"
+                result.update(ok=False, state=state, credit_known=False)
+                result.pop("credit", None)
+                result["error"] = result.get("error") or result.get("msg") or "HTTP %d" % exc.code
+            terminal = result.get("code") in (11140, 14003, 6004, 10001)
+            result["retryable"] = 500 <= exc.code < 600 and not terminal
+            return result
+        except (urllib.error.URLError, OSError) as exc:
+            return {"ok": False, "state": "failed", "credit_known": False,
+                    "error": str(exc), "retryable": True}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "state": "failed", "credit_known": False,
+                    "error": str(exc), "retryable": False}
 
     def report_activity(self):
         """国内版对话活跃上报：一条 /v2/report 点亮官方 growth 连登。
@@ -3816,9 +3932,16 @@ class Account(object):
                 self.token_expired = True
             if model:
                 # Model-scoped throttle: keep the account usable for every other model.
-                wait = max(1.0, float(until) - time.time()) if until else (
-                    3.0 if single_account else float(cooldown))
                 now = time.time()
+                # Concurrent in-flight failures describe the same active window;
+                # do not turn it into a sliding timeout. Explicit upstream reset
+                # deadlines (quota caps) may still supersede a short busy window.
+                if not until and self.model_cooldowns.get(model, 0.0) > now:
+                    return
+                wait = max(1.0, float(until) - now) if until else (
+                    3.0 if single_account else float(cooldown))
+                if not until and model_busy_is_transient(detail or message):
+                    wait = min(wait, 15.0)
                 self.model_cooldowns[model] = now + wait
                 # 起始时刻：面板要如实说「限流时刻 + 恢复时间」，而恢复时刻减不出
                 # 起始时刻（wait 来自 60s→10m 的阶梯，不落库）。记这一次就够了。
@@ -3923,6 +4046,9 @@ class Account(object):
         request clears both through note_success().
         """
         with self._throttle_lock:
+            remaining = self.model_cooldowns.get(model, 0.0) - time.time()
+            if remaining > 0:
+                return remaining
             self._decay_soft_streak()
             self.unscoped_streak += 1
             return unverified_soft_backoff(self.unscoped_streak)

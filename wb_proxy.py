@@ -11816,7 +11816,7 @@ def runtime_settings_view():
         "accounts_dir": ACCOUNTS_DIR,
         "usage_dir": USAGE_DIR,
         "settings_file": wb_settings.settings_path(ACCOUNTS_DIR),
-        "version": "2.1.1",
+        "version": "0.2.0",
     }
 def current_account():
     """Account used for display purposes (health / usage summaries)."""
@@ -13986,6 +13986,13 @@ def cleanup_orphan_tool_calls(messages):
         return messages, False
     call_ids = set()
     result_ids = set()
+    invalid_calls = False
+    def valid_call(tc):
+        if not isinstance(tc, dict):
+            return False
+        payload = tc.get("custom") if tc.get("type") == "custom" else tc.get("function")
+        name = payload.get("name") if isinstance(payload, dict) else None
+        return isinstance(name, str) and bool(name.strip())
     for m in messages:
         if not isinstance(m, dict):
             continue
@@ -13998,11 +14005,13 @@ def cleanup_orphan_tool_calls(messages):
             calls = m.get("tool_calls")
             if isinstance(calls, list):
                 for tc in calls:
-                    if isinstance(tc, dict):
+                    if valid_call(tc):
                         tid = tc.get("id")
                         if isinstance(tid, str) and tid:
                             call_ids.add(tid)
-    if not call_ids and not result_ids:
+                    else:
+                        invalid_calls = True
+    if not call_ids and not result_ids and not invalid_calls:
         return messages, False
     keep = call_ids & result_ids
     changed = False
@@ -14013,7 +14022,7 @@ def cleanup_orphan_tool_calls(messages):
         if not isinstance(calls, list) or not calls:
             continue
         kept = [tc for tc in calls
-                if isinstance(tc, dict) and isinstance(tc.get("id"), str)
+                if valid_call(tc) and isinstance(tc.get("id"), str)
                 and tc["id"] in keep]
         if len(kept) == len(calls):
             continue
@@ -16899,19 +16908,8 @@ _RESTRICTION_403_MARKERS = ("unusual activity", "账号存在异常行为", "已
 
 
 def restriction_is_account_level(detail):
-    """True when a 403 body says the ACCOUNT is restricted, not the content.
-
-    实测正文：{"code":11140,"msg":"request illegal",...,"displayMsg":{"en":
-    "Your account has been restricted due to unusual activity","zh":"账号存在
-    异常行为，已被限制使用"}}。en 在前 zh 在后，短截断也保得住 code 与 en；
-    拿不全的正文宁可漏判回内容审核路径，也不误判。
-    """
-    if not detail:
-        return False
-    if _RESTRICTED_403_CODE_RE.search(detail):
-        return True
-    lowered = detail.lower()
-    return any(marker in lowered for marker in _RESTRICTION_403_MARKERS)
+    """Use the shared precise 403 classifier; model/moderation routing stays local."""
+    return wb_accounts.restriction_is_account_level(403, detail)
 
 
 def _unescape_body(detail):
@@ -18422,6 +18420,49 @@ class SSEHeartbeat:
         return False
 
 
+def _stream_merge_name(current, fragment):
+    """Accept repeated/cumulative names without losing genuine suffix deltas."""
+    if not fragment or fragment == current:
+        return current
+    if not current or fragment.startswith(current):
+        return fragment
+    return current + fragment
+
+
+def _stream_tool_index(call, calls, indices):
+    """Resolve explicit index and stable id; never invent a new call per delta.
+
+    Unkeyed continuations are safe only when there is one candidate. Refuse
+    ambiguous multi-call deltas rather than route arguments to the wrong tool.
+    Internal keys are arrival ordered; indices maps the upstream's indices.
+    """
+    index, call_id = call.get("index"), call.get("id")
+    if call_id:
+        for key, entry in calls.items():
+            if entry.get("id") == call_id:
+                if index is not None:
+                    indices[index] = key
+                return key
+    if index is not None and index in indices:
+        key = indices[index]
+        bound = indices.get(("id", key))
+        if not call_id or not bound or bound == call_id:
+            if call_id:
+                indices[("id", key)] = call_id
+            return key
+    elif index is None and not call_id:
+        if len(calls) == 1:
+            return next(iter(calls))
+        if calls:
+            raise ValueError("ambiguous unindexed tool-call continuation")
+    key = max(calls, default=-1) + 1
+    if index is not None:
+        indices[index] = key
+    if call_id:
+        indices[("id", key)] = call_id
+    return key
+
+
 def aggregate_stream(raw_iter, model, resp_id):
     """Fold an SSE stream into one non-streaming chat.completion object.
 
@@ -18429,8 +18470,9 @@ def aggregate_stream(raw_iter, model, resp_id):
     (for example the intl -sg route); that must not replace the logical model.
     """
     logical_model = model
-    content, reasoning, finish = [], [], "stop"
+    content, reasoning, finish = [], [], None
     tool_calls_map = {}
+    tool_indices = {}
     usage = None
     started = time.time()
     first_chunk_at = None
@@ -18463,9 +18505,7 @@ def aggregate_stream(raw_iter, model, resp_id):
             if delta.get("reasoning_content"):
                 reasoning.append(delta["reasoning_content"])
             for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index")
-                if idx is None:
-                    idx = len(tool_calls_map)
+                idx = _stream_tool_index(tc, tool_calls_map, tool_indices)
                 fn = tc.get("function") or {}
                 call_id = tc.get("id")
                 fn_name = fn.get("name") or ""
@@ -18484,15 +18524,14 @@ def aggregate_stream(raw_iter, model, resp_id):
                     if call_id:
                         entry["id"] = call_id
                     if fn_name:
-                        entry["function"]["name"] = (entry["function"]["name"] or "") + fn_name
+                        entry["function"]["name"] = _stream_merge_name(entry["function"]["name"], fn_name)
                     if fn_args:
                         entry["function"]["arguments"] = (entry["function"]["arguments"] or "") + fn_args
             fc = delta.get("function_call")
-            # PATCH2-BY-OPS: 上游会在流末尾发 function_call:{"name":"","arguments":""}
-            # 占位。原判断对空 dict 成立，会凭空生成 tool_call 并伪造 id，
-            # 导致 finish_reason 被改成 "tool_calls"（参数全空）→ 严格客户端死等。
-            # 故：只要 name 为空即视为无效占位直接跳过。
-            fc_is_empty = (not isinstance(fc, dict)) or (not fc.get("name"))
+            # A legacy arguments-only continuation belongs to an existing
+            # call; an empty placeholder must still never create a new one.
+            fc_is_empty = (not isinstance(fc, dict)) or not (
+                fc.get("name") or (0 in tool_calls_map and fc.get("arguments")))
             if fc and isinstance(fc, dict) and not fc_is_empty:
                 idx = 0
                 if idx not in tool_calls_map:
@@ -18512,6 +18551,11 @@ def aggregate_stream(raw_iter, model, resp_id):
                         entry["function"]["arguments"] += fc["arguments"]
             if choice.get("finish_reason"):
                 finish = choice["finish_reason"]
+    if finish is None and not saw_done:
+        raise ValueError("incomplete upstream stream: no terminal finish_reason or [DONE]")
+    if finish is None and not (content or reasoning or tool_calls_map):
+        raise ValueError("empty upstream stream: no completion output")
+    finish = finish or "stop"
     message = {"role": "assistant", "content": "".join(content)}
     if reasoning:
         message["reasoning_content"] = "".join(reasoning)
@@ -20495,9 +20539,10 @@ def stream_responses_events(upstream, model, holder):
     outputs = []
     reason_index = None
     msg_index = None
-    finish = "stop"
+    finish = None
     usage = None
     tool_calls_map = {}
+    tool_indices = {}
     text_buffer = ""
     dsml_tool_calls = []
     saw_done = False
@@ -20559,6 +20604,32 @@ def stream_responses_events(upstream, model, holder):
             item["content"] = [{"type": "output_text", "text": "".join(text_parts),
                               "annotations": _annotations()}]
         return item
+    def _open_tool(entry):
+        """Delay dispatch metadata until names are assembled; replay early args."""
+        if entry.get("opened") or not entry["name"].strip():
+            return
+        entry["opened"] = True
+        entry["custom"] = entry["name"] in custom_names
+        entry["item_id"] = _new_id("ctc_" if entry["custom"] else "fc_")
+        entry["output_index"] = len(outputs)
+        outputs.append(None)
+        item = {"id": entry["item_id"], "status": "in_progress",
+                "call_id": entry["id"], "name": entry["name"]}
+        if entry["custom"]:
+            item.update(type="custom_tool_call", input="")
+        else:
+            item.update(type="function_call", arguments="")
+        stamp_namespace(item, ns_map)
+        yield ev("response.output_item.added", {
+            "output_index": entry["output_index"], "item": item,
+        })
+        if entry["arguments"]:
+            yield ev("response.custom_tool_call_input.delta" if entry["custom"]
+                     else "response.function_call_arguments.delta", {
+                "output_index": entry["output_index"], "item_id": entry["item_id"],
+                "call_id": entry["id"], "delta": entry["arguments"],
+            })
+
     def _finalize():
         # Close out the stream: reasoning item, structured tool calls,
         # DSML fallback, the message item and response.completed.
@@ -20772,8 +20843,10 @@ def stream_responses_events(upstream, model, holder):
             and bool("".join(reason_parts).strip())
             and not tool_calls_map and not dsml_tool_calls
             and not _internal_calls
-            and finish != "length" and not dropped_truncated)
-        status = ("completed" if (finish != "length" and not dropped_truncated)
+            and finish != "length" and not dropped_truncated
+            and not premature_eof)
+        status = ("completed" if (finish != "length" and not dropped_truncated
+                                  and not premature_eof)
                   else "incomplete")
         if empty_reasoning_only:
             status = "failed"
@@ -20781,6 +20854,8 @@ def stream_responses_events(upstream, model, holder):
         final = resp_obj(status)
         if finish == "length":
             final["incomplete_details"] = {"reason": "max_output_tokens"}
+        elif status == "incomplete":
+            final["incomplete_details"] = {"reason": "upstream_stream_incomplete"}
         if empty_reasoning_only:
             final["error"] = {
                 "code": "empty_reasoning_only",
@@ -20788,7 +20863,7 @@ def stream_responses_events(upstream, model, holder):
             }
             yield ev("response.failed", {"response": final})
         elif not holder.get("suppress_completion"):
-            yield ev("response.completed", {"response": final})
+            yield ev("response." + status, {"response": final})
 
     # 只有第一轮开场。第二轮以后再送一次 response.created，客户端会
     # 看到同一则回应被开了两次。
@@ -20832,81 +20907,19 @@ def stream_responses_events(upstream, model, holder):
                     "summary_index": 0, "delta": piece,
                 })
             for tc in delta.get("tool_calls") or []:
-                idx = tc.get("index", 0)
+                idx = _stream_tool_index(tc, tool_calls_map, tool_indices)
                 fn = tc.get("function") or {}
-                fn_name = fn.get("name") or ""
-                fn_args = fn.get("arguments") or ""
-                call_id = tc.get("id") or ""
-                # web_search / web_fetch 由反代执行，不转发给客户端
-                if idx in _internal_calls or (
-                        _own_web_tools and fn_name
-                        and wb_webtools.is_internal_tool(fn_name)):
-                    entry = _internal_calls.setdefault(idx, {"name": fn_name, "arguments": ""})
-                    if fn_name:
-                        entry["name"] = fn_name
-                    if fn_args:
-                        entry["arguments"] += fn_args
-                    continue
-                if idx not in tool_calls_map:
-                    out_idx = len(outputs)
-                    outputs.append(None)
-                    c_id = call_id or _new_id("call_")
-                    is_custom = bool(fn_name) and fn_name in custom_names
-                    entry = {
-                        "output_index": out_idx,
-                        "id": c_id,
-                        "name": fn_name,
-                        "arguments": fn_args,
-                        "custom": is_custom,
-                        "item_id": _new_id("ctc_" if is_custom else "fc_"),
-                    }
-                    tool_calls_map[idx] = entry
-                    item = {
-                        "id": entry["item_id"],
-                        "status": "in_progress",
-                        "call_id": c_id,
-                        "name": fn_name,
-                    }
-                    if is_custom:
-                        item["type"] = "custom_tool_call"
-                        item["input"] = ""
-                    else:
-                        item["type"] = "function_call"
-                        item["arguments"] = ""
-                    # namespace 必须在 output_item.added 就带上（照 CiderCC-UwU
-                    # proxy.mjs openItem 的做法）。事后才补只会改到 done，
-                    # 客户端早就从 added 事件派发过了。
-                    stamp_namespace(item, ns_map)
-                    yield ev("response.output_item.added", {
-                        "output_index": out_idx,
-                        "item": item,
-                    })
-                else:
-                    entry = tool_calls_map[idx]
-                    if fn_name and not entry["name"]:
-                        entry["name"] = fn_name
-                        if fn_name in custom_names:
-                            entry["custom"] = True
-                    if fn_args:
-                        entry["arguments"] += fn_args
-                # The first chunk may already carry arguments. Emit it after
-                # output_item.added, just like subsequent chunks, without
-                # adding it to the accumulated arguments a second time.
-                if fn_args:
-                    if entry.get("custom"):
-                        yield ev("response.custom_tool_call_input.delta", {
-                            "output_index": entry["output_index"],
-                            "item_id": entry["item_id"],
-                            "call_id": entry["id"],
-                            "delta": fn_args,
-                        })
-                    else:
-                        yield ev("response.function_call_arguments.delta", {
-                            "output_index": entry["output_index"],
-                            "item_id": entry["item_id"],
-                            "call_id": entry["id"],
-                            "delta": fn_args,
-                        })
+                entry = tool_calls_map.setdefault(idx, {
+                    "id": tc.get("id") or _new_id("call_"),
+                    "name": "", "arguments": "", "opened": False,
+                })
+                if tc.get("id"):
+                    entry["id"] = tc["id"]
+                entry["name"] = _stream_merge_name(entry["name"], fn.get("name") or "")
+                entry["arguments"] += fn.get("arguments") or ""
+                # A name can be fragmented even after arguments begin. Keep
+                # tool metadata/args together until terminal validation; never
+                # dispatch a partial name, wrong namespace or custom type.
             piece = delta.get("content")
             if piece:
                 if msg_index is None:
@@ -20997,13 +21010,24 @@ def stream_responses_events(upstream, model, holder):
     # completed: drop them before finalize so the client never receives a
     # function_call_arguments.done / output_item.done with unparsable
     # arguments. Complete calls in the same batch are kept.
+    premature_eof = (finish is None and (not saw_done or not (
+        text_parts or reason_parts or tool_calls_map or dsml_tool_calls or text_buffer)))
     dropped_truncated = 0
-    if tool_calls_map and (finish == "length" or not saw_done):
-        for idx in sorted(tool_calls_map.keys()):
-            entry = tool_calls_map[idx]
-            if is_truncated_arguments(entry.get("arguments")):
-                tool_calls_map.pop(idx, None)
+    for idx in sorted(list(tool_calls_map)):
+        entry = tool_calls_map[idx]
+        if (not entry["name"].strip()
+                or ((finish == "length" or not saw_done)
+                    and is_truncated_arguments(entry["arguments"]))):
+            tool_calls_map.pop(idx)
+            if entry["name"].strip() or entry["arguments"].strip():
                 dropped_truncated += 1
+        elif _own_web_tools and wb_webtools.is_internal_tool(entry["name"]):
+            # Only validated calls from a terminal stream may run internally.
+            if not premature_eof:
+                _internal_calls[idx] = entry
+            tool_calls_map.pop(idx)
+        else:
+            yield from _open_tool(entry)
     yield from _finalize()
 
 # ---------------------------------------------------------------------------
@@ -21194,7 +21218,7 @@ class Handler(BaseHTTPRequestHandler):
             super().finish()
         except (ConnectionResetError, BrokenPipeError, ConnectionAbortedError):
             pass
-    server_version = "wb-proxy/2.1.1"
+    server_version = "wb-proxy/0.2.0"
     def log_message(self, fmt, *args):
         # 静默过滤前端看板高频定时心跳的正常 200 GET 请求（/logs、/usage、/accounts 轮询等）
         # 避免自增死循环刷屏与日志污染。遇 4xx/5xx 异常或所有非 GET 业务操作依然如实记录。
