@@ -28,6 +28,7 @@ import urllib.parse
 import urllib.request
 
 import wb_settings
+import wb_session
 import wb_codearts_crypto as crypto
 
 # ---------------------------------------------------------------------------
@@ -2098,11 +2099,12 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
             "CodeArts 出口未启用：请到设置页打开「启用 CodeArts 出口」。")
     pool = pool_for(config["accounts_dir"])
     model = body.get("model") or ""
+    routing_key = wb_session.routing_key(session_key, "codearts")
     exclude = set()
     last_error = None
     attempts = max(2, len(pool.accounts) + 1)
     for _ in range(attempts):
-        acct = pool.pick(model, session_key=session_key, exclude=exclude,
+        acct = pool.pick(model, session_key=routing_key, exclude=exclude,
                          allowed_accounts=allowed_accounts)
         if acct is None:
             if pool.accounts and any(a.active_concurrent > 0 for a in pool.accounts):
@@ -2120,7 +2122,7 @@ def open_chat(config, body, session_key=None, allowed_accounts=None):
                 pass
             stream, used = _client_chat(acct, body, session_key)
             pool.note_success(acct)
-            pool.bind_session(session_key, acct.uid)
+            pool.bind_session(routing_key, acct.uid)
             return stream, acct, used
         except CodeArtsBadRequest:
             pool.release(acct)

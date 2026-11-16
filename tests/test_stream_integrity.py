@@ -20,6 +20,7 @@ def load_proxy():
     names = {"aggregate_stream", "iter_sse_lines", "strip_data_prefix",
              "repair_leaked_tool_calls", "estimate_tokens", "_new_id",
              "normalize_usage_cache_aliases", "_best_cached_tokens", "is_truncated_arguments",
+             "_cache_observation", "_merge_usage_frame",
              "cleanup_orphan_tool_calls", "stream_responses_events",
              "_responses_usage", "stamp_namespace", "apply_namespace_to_calls",
              "_unwrap_custom_input", "restriction_is_account_level",

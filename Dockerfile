@@ -32,6 +32,7 @@ COPY --from=tls-bridge-artifact /wb-tls-bridge ./bin/wb-tls-bridge
 COPY catalog/ ./catalog/
 COPY licenses/ ./licenses/
 COPY LICENSE NOTICE.md ./
+COPY docs/SESSION-IDENTITY.md docs/CACHE-OBSERVATION.md docs/LOG-REDACTION.md ./docs/
 COPY --from=tls-bridge-artifact /licenses/ ./licenses/
 RUN chmod 0755 /app/bin/wb-tls-bridge &&     mkdir -p /app/accounts /app/usage /app/subbridge-data &&     python -m compileall -q /app
 VOLUME ["/app/accounts", "/app/usage", "/app/subbridge-data"]

@@ -11478,7 +11478,7 @@ function accountRow(a){
     + '<td style="text-align:left;white-space:normal" data-label="积分">' + credText + '</td>'
     + '<td style="text-align:right" data-label="请求">' + fmt(usage.requests) + '</td>'
     + '<td style="text-align:right" data-label="总 token" data-tip="' + fmt(usage.total_tokens) + '">' + fmtCompact(usage.total_tokens) + '</td>'
-    + '<td style="text-align:right" data-label="缓存" data-tip="' + fmt(usage.cached_tokens) + '">' + fmtCompact(usage.cached_tokens) + '</td>'
+    + '<td style="text-align:right" data-label="缓存" data-tip="' + fmt(usage.cached_tokens) + '">' + (usage.cache_observed_requests ? fmtCompact(usage.cached_tokens) : '—') + '</td>'
     + '<td class="acct-actions" style="text-align:center;white-space:nowrap;vertical-align:middle">'
     + '<div class="acct-actions-col">'
     +   '<div class="acct-actions-row">'
@@ -20060,6 +20060,10 @@ function fillMatrixFilters(usage){
   }
 }
 
+function cacheObservationRate(stat){
+  const p = stat && stat.cache_observed_prompt_tokens;
+  return Number.isFinite(p) && p > 0 ? (stat.cached_tokens || 0) / p * 100 : null;
+}
 function renderPerfMatrix(usage, perf){
   const matrixEl = document.getElementById("perfMatrix");
   if(!matrixEl) return;
@@ -20237,7 +20241,8 @@ function renderPerfMatrix(usage, perf){
       const m_ttft = mpEff.ttft_ms ? (ms(mpEff.ttft_ms.avg) + " <span style='color:var(--dim);font-size:11px'>(P50 " + ms(mpEff.ttft_ms.p50) + ")</span>") : "-";
       const m_tps = mpEff.tokens_per_sec ? ('<b style="color:var(--accent2)">' + mpEff.tokens_per_sec.avg.toFixed(1) + '</b> <span style="font-size:11px;color:var(--dim)">tok/s</span>') : "-";
       const m_wall = mpEff.wall_ms ? ms(mpEff.wall_ms.avg) : "-";
-      const m_cache = (m.prompt_tokens > 0) ? pct(m.cached_tokens / m.prompt_tokens * 100) : (mpEff.cache_hit_pct ? mpEff.cache_hit_pct.avg.toFixed(1) + "%" : "-");
+      const observedCache = cacheObservationRate(m);
+      const m_cache = observedCache == null ? "—" : pct(observedCache);
       /* Share of the table's own total - the figure in the summary row -
        * rather than of the largest row. Dividing by the maximum made the
        * biggest model read 100% and every other row a fraction of it, which
@@ -20814,9 +20819,10 @@ function renderAnalytics(data){
 
   // KPI 5: 缓存命中率
   const elCacheRate = document.getElementById('kpiCacheRate');
-  if(elCacheRate) elCacheRate.textContent = (currentSum.cache_hit_pct != null ? currentSum.cache_hit_pct.toFixed(1) : '0.0') + '%';
+  const observedRate = cacheObservationRate(currentSum);
+  if(elCacheRate) elCacheRate.textContent = observedRate == null ? '—' : observedRate.toFixed(1) + '%';
   const elCacheDetail = document.getElementById('kpiCacheDetail');
-  if(elCacheDetail) elCacheDetail.textContent = '缓存 ' + fmtCompact(currentSum.cached_tokens || 0) + ' tokens · 提示词前缀命中复用比';
+  if(elCacheDetail) elCacheDetail.textContent = '缓存 ' + fmtCompact(currentSum.cached_tokens || 0) + ' tokens · 已观测 ' + (currentSum.cache_observed_requests || 0) + ' · 未知 ' + (currentSum.cache_unknown_requests || 0);
 
   // KPI 6: 请求数（成功数）与 KPI 7: 成功率，拆成两张卡
   const elReqTitle = document.getElementById('kpiReqTitle');
@@ -21025,7 +21031,7 @@ function renderKeyTable(data){
       + '<span style="color:var(--think)">' + fmtCompact(st.reasoning_tokens || 0) + '</span>'
       + '</td>';
     const cacheCell = '<td data-label="缓存命中">'
-      + (st.cache_hit_pct != null ? st.cache_hit_pct.toFixed(1) : '0.0') + '%</td>';
+      + (st.cache_hit_pct != null ? st.cache_hit_pct.toFixed(1) + '%' : '—') + '</td>';
     const creditCell = '<td data-label="消耗积分"><b style="color:var(--accent2)">'
       + (st.credit != null ? Number(st.credit).toFixed(2) : '0.00') + '</b></td>';
     const modelCell = '<td style="text-align:left;max-width:440px" data-label="调用的模型分布">'
@@ -21154,7 +21160,7 @@ async function loadPrevSummary(untilAt){
       req:    a.req    + (b.requests       || 0),
       cred:   a.cred   + (b.credit         || 0),
       cached: a.cached + (b.cached_tokens  || 0),
-      prompt: a.prompt + (b.prompt_tokens  || 0),
+      prompt: a.prompt + (b.cache_observed_prompt_tokens || 0),
     }), {tok:0, req:0, cred:0, cached:0, prompt:0});
     return (t.req || t.tok) ? t : null;
   }catch(e){ return null; }
@@ -21181,15 +21187,23 @@ function drawSpark(id, vals, colorVar){
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.clearRect(0, 0, W, H);
   const color = seriesColor(colorVar);
-  const max = Math.max(...vals), min = Math.min(...vals);
+  const known = vals.filter(v => v != null && Number.isFinite(v));
+  if(!known.length) return;
+  const max = Math.max(...known), min = Math.min(...known);
   const rng = (max - min) || 1;
   const step = W / (vals.length - 1);
   const X = i => i * step;
   const Y = v => H - 3 - (v - min) / rng * (H - 8);
   ctx.beginPath();
-  vals.forEach((v, i) => { i ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v)); });
+  let connected = false;
+  vals.forEach((v, i) => {
+    if(v == null || !Number.isFinite(v)){ connected = false; return; }
+    connected ? ctx.lineTo(X(i), Y(v)) : ctx.moveTo(X(i), Y(v));
+    connected = true;
+  });
   ctx.strokeStyle = color; ctx.lineWidth = 1.4; ctx.lineJoin = 'round'; ctx.lineCap = 'round';
   ctx.stroke();
+  if(known.length !== vals.length) return; // gaps are unknown, never fill them as zero
   ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
   ctx.globalAlpha = .14; ctx.fillStyle = color; ctx.fill(); ctx.globalAlpha = 1;
 }
@@ -21201,7 +21215,7 @@ function drawSparks(){
   drawSpark('sparkTokens', arr.map(b => b.total_tokens || 0), '--chart-bar');
   drawSpark('sparkReqs',   arr.map(b => b.requests || 0), '--chart-line');
   drawSpark('sparkSpeed',  arr.map(b => (b.completion_tokens || 0) / step), '--chart-bar');
-  drawSpark('sparkCache',  arr.map(b => b.prompt_tokens ? (b.cached_tokens || 0) / b.prompt_tokens * 100 : 0), '--chart-line');
+  drawSpark('sparkCache',  arr.map(b => cacheObservationRate(b)), '--chart-line');
   drawSpark('sparkCost',   arr.map(b => b.credit || 0), '--chart-bar');
 }
 function nicknameOf(uid){
@@ -21411,7 +21425,7 @@ function renderKpis(){
 
   // ⑤ 缓存
   $('kCache').innerHTML = fmtPct(w.cache_hit_pct);
-  $('kCacheSub').innerHTML = `缓存复用 <b>${numSpan(w.cached_tokens)}</b> tokens`;
+  $('kCacheSub').innerHTML = `缓存复用 <b>${numSpan(w.cached_tokens)}</b> tokens · 已观测 ${w.cache_observed_requests || 0} · 未知 ${w.cache_unknown_requests || 0}`;
 
   // ⑥ 花费
   const usd = a.usd_cny ? w.cost_cny / a.usd_cny : null;
@@ -21421,7 +21435,7 @@ function renderKpis(){
   $('pageSub').textContent = `区间 ${fmtCompact(w.total_tokens)} tokens · ${fmtCompact(w.requests)} 次请求 · 更新于 ${new Date().toLocaleTimeString('zh-CN', {hour12:false})}`;
 
   // B 版：环比徽章
-  const selfCache = w.prompt_tokens ? (w.cached_tokens || 0) / w.prompt_tokens * 100 : null;
+  const selfCache = cacheObservationRate(w);
   const prevCache = (prevSummary && prevSummary.prompt) ? prevSummary.cached / prevSummary.prompt * 100 : null;
   setDelta('deltaTokens', w.total_tokens, prevSummary ? prevSummary.tok : null);
   setDelta('deltaReqs', w.requests, prevSummary ? prevSummary.req : null);

@@ -1174,9 +1174,8 @@ class Account(object):
         # a stale value could sit on disk for days. Runtime-only, like
         # model_cooldowns below; see RUNTIME_ONLY_FIELDS and VOLATILE_FIELDS.
         self.last_error = ""
-        # Full upstream body behind `last_error`, for the dashboard tooltip. Kept
-        # in its own runtime-only field so the visible label keeps the truncation
-        # it has always had; never persisted, never exported.
+        # Redacted, bounded upstream diagnostic for the dashboard tooltip.
+        # Runtime-only: never persist or export an unfiltered upstream body.
         self.last_error_detail = ""
         self.cooldown_until = 0.0
         # 运行时标记：上游返回 401 或 token 为空时置为 True，提示需重新登录
@@ -3918,16 +3917,18 @@ class Account(object):
     def _set_last_error(self, message):
         """Record refresh errors alongside the state shown in the panel."""
         with self._throttle_lock:
-            self.last_error = str(message)[:200]
+            from wb_diagnostics import diagnostic_detail
+            self.last_error = diagnostic_detail(message)
             self.last_error_detail = ""
 
     def note_error(self, message, cooldown=60, single_account=False, model=None, until=None,
                    detail=None):
         with self._throttle_lock:
-            self.last_error = str(message)[:200]
-            # The visible label keeps its existing truncation; `detail` carries the
-            # untouched upstream body so the panel can show it on hover.
-            self.last_error_detail = str(detail)[:2000] if detail else ""
+            from wb_diagnostics import diagnostic_detail
+            self.last_error = diagnostic_detail(message)
+            # Only diagnostic state is filtered. Classification below still uses
+            # the original message/detail, never this redacted copy.
+            self.last_error_detail = diagnostic_detail(detail) if detail else ""
             if _auth_failure_text(message):
                 self.token_expired = True
             if model:
@@ -3966,7 +3967,8 @@ class Account(object):
         """
         with self._throttle_lock:
             self.last_error = "HTTP 403 (account banned)"
-            self.last_error_detail = str(detail)[:2000] if detail else ""
+            from wb_diagnostics import diagnostic_detail
+            self.last_error_detail = diagnostic_detail(detail) if detail else ""
             self.enabled = False
             self.tasks_enabled = False
             self.account_banned = True
@@ -3986,7 +3988,8 @@ class Account(object):
         """
         until = next_local_4am()
         with self._throttle_lock:
-            self.last_error = str(message)[:200]
+            from wb_diagnostics import diagnostic_detail
+            self.last_error = diagnostic_detail(message)
             self.balance_until = max(self.balance_until, until)
         return until
 
@@ -4017,7 +4020,8 @@ class Account(object):
             self._decay_soft_streak()
             self.soft_streak += 1
             wait = soft_backoff(self.soft_streak)
-            self.last_error = str(message)[:200]
+            from wb_diagnostics import diagnostic_detail
+            self.last_error = diagnostic_detail(message)
             self.cooldown_until = max(self.cooldown_until, time.time() + wait)
         return wait
 
@@ -4056,7 +4060,8 @@ class Account(object):
     def note_failure(self, message):
         """5xx / transport failure: feed the breaker counter."""
         with self._throttle_lock:
-            self.last_error = str(message)[:200]
+            from wb_diagnostics import diagnostic_detail
+            self.last_error = diagnostic_detail(message)
             self._decay_strikes()
             self.fails += 1
             if self.fails >= BREAKER_THRESHOLD:
@@ -4078,7 +4083,8 @@ class Account(object):
     def note_unknown_failure(self, message):
         """Unknown error: degrade counter plus the shared breaker counter."""
         with self._throttle_lock:
-            self.last_error = str(message)[:200]
+            from wb_diagnostics import diagnostic_detail
+            self.last_error = diagnostic_detail(message)
             self._decay_strikes()
             self.degrade_count += 1
             self.fails += 1
