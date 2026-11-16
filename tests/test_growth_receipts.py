@@ -26,7 +26,7 @@ def load_tasks():
                 'DESKTOP_ONLY_TASKS', 'NIGHT_TASK_CODES', 'EXPERT_ID_POOL', 'TEAM_ID_POOL',
                 'LIB_DOC_URL', '_EXPERT_ID_RE'} for t in node.targets):
             exec(compile(ast.Module(body=[node], type_ignores=[]), 'wb_tasks.py', 'exec'), ns)
-        elif isinstance(node, ast.FunctionDef):
+        elif isinstance(node, (ast.FunctionDef, ast.ClassDef)):
             exec(compile(ast.Module(body=[node], type_ignores=[]), 'wb_tasks.py', 'exec'), ns)
     return ns
 
@@ -107,6 +107,83 @@ class AcceptanceTests(unittest.TestCase):
         result = self.ns['accept_tasks'](account(), ['Library_read'])
         self.assertFalse(result['ok'])
         self.assertEqual(self.net.call_count, 1)
+
+
+class TerminalReadbackTests(unittest.TestCase):
+    def test_terminal_readback_or_web_failure_stops_accept_chunks(self):
+        for stage in ('readback', 'web', 'web_readback'):
+            for kind in ('http', 'business'):
+                for status in (401, 403, 429, 11140, 14003, 6004, 6005, 10001):
+                    if kind == 'http' and status > 599:
+                        continue
+                    with self.subTest(stage=stage, kind=kind, status=status):
+                        ns = load_tasks()
+                        net = ns['_accounts'].urlopen
+                        failure = (urllib.error.HTTPError('https://offline.invalid', status,
+                            'terminal', {}, io.BytesIO(b'{}')) if kind == 'http' else
+                            response({'code': status, 'msg': 'terminal diagnostic'}))
+                        unchanged = response({'code': 0, 'data': {'tasks': [
+                            {'task_code': 'a', 'accept_status': 'not_accepted'}]}})
+                        sequence = [receipt('a')]
+                        if stage != 'readback':
+                            sequence.append(unchanged)
+                        if stage == 'web_readback':
+                            sequence.append(receipt('a'))
+                        sequence.append(failure)
+                        net.side_effect = sequence + [receipt('b')] * 5
+                        result = ns['accept_tasks'](account(), ['a', 'b'], chunk=1)
+                        self.assertEqual(net.call_count, len(sequence), 'wrote after terminal failure')
+                        self.assertTrue(result.get('terminal'), result)
+                        self.assertFalse(result['ok'])
+                        self.assertEqual(result['failed'], ['a', 'b'])
+                        self.assertIn(str(status), str(result['reasons']))
+
+    def test_http_400_with_terminal_business_body_never_falls_back_or_continues(self):
+        for entry in ('accept_tasks', 'run_growth_tasks', 'run_miniprogram_tasks'):
+            ns = load_tasks()
+            failure = urllib.error.HTTPError('https://offline.invalid', 400, 'business restriction', {},
+                io.BytesIO(b'{"code":11140,"msg":"account restriction"}'))
+            net = ns['_accounts'].urlopen
+            net.side_effect = [failure] + [receipt('a')] * 10
+            if entry == 'accept_tasks':
+                result = ns[entry](account(), ['a', 'b'], chunk=1)
+            else:
+                rows = [task('Library_read' if entry == 'run_growth_tasks' else 'Sequential_Tasks_1',
+                             'completed'), task('skill_1', 'completed')]
+                ns['discover_growth_tasks'] = Mock(return_value={'ok': True, 'tasks': rows, 'errors': []})
+                result = ns[entry](account(), gap=0,
+                    **({'tasks': rows} if entry == 'run_miniprogram_tasks' else {}))
+            with self.subTest(entry=entry):
+                self.assertEqual(net.call_count, 1)
+                self.assertTrue(result.get('terminal'), result)
+
+    def test_http_status_stays_terminal_even_with_nonterminal_body(self):
+        ns = load_tasks()
+        ns['_accounts'].urlopen.side_effect = urllib.error.HTTPError(
+            'https://offline.invalid', 429, 'terminal', {}, io.BytesIO(b'{"code":400}'))
+        with self.assertRaises(RuntimeError) as raised:
+            ns['fetch_growth_tasks'](account())
+        self.assertTrue(getattr(raised.exception, 'terminal', False))
+
+    def test_web_http_business_restriction_preserves_body_diagnostic(self):
+        ns = load_tasks()
+        ns['fetch_growth_tasks'] = Mock(return_value=[task('a')])
+        ns['_accounts'].urlopen.side_effect = [receipt('a'), urllib.error.HTTPError(
+            'https://offline.invalid', 400, 'business restriction', {},
+            io.BytesIO(b'{"code":11140,"msg":"account restriction detail"}'))]
+        result = ns['accept_tasks'](account(), ['a', 'b'], chunk=1)
+        self.assertTrue(result.get('terminal'), result)
+        self.assertIn('account restriction detail', str(result['reasons']))
+        self.assertEqual(ns['_accounts'].urlopen.call_count, 2)
+
+    def test_web_business_rejection_diagnostic_is_not_discarded(self):
+        ns = load_tasks()
+        ns['_accounts'].urlopen.side_effect = [receipt('a'),
+            response({'code': 400, 'msg': 'web rejection diagnostic'})]
+        ns['fetch_growth_tasks'] = Mock(return_value=[task('a')])
+        result = ns['accept_tasks'](account(), ['a'])
+        self.assertIn('web rejection diagnostic', str(result['reasons']))
+        self.assertFalse(result.get('terminal', False))
 
 
 class DiscoveryTests(unittest.TestCase):
@@ -202,6 +279,179 @@ class ClaimTests(unittest.TestCase):
             result = ns['claim_task'](account(), 'Library_read')
             self.assertFalse(result['ok'])
             self.assertEqual(ns['_accounts'].urlopen.call_count, 1)
+
+
+class TerminalRunnerTests(unittest.TestCase):
+    def test_initial_terminal_discovery_blocks_other_view_writes(self):
+        for kind in ('http', 'business'):
+            ns = load_tasks()
+            ns['_accounts'].urlopen.side_effect = [
+                urllib.error.HTTPError('https://offline.invalid', 429, 'terminal', {}, io.BytesIO(b'{}'))
+                if kind == 'http' else response({'code': 11140, 'msg': 'restricted'}),
+                response({'code': 0, 'data': {'tasks': [
+                    {'task_code': 'Library_read', 'accept_status': 'not_accepted'}]}})]
+            ns.update(accept_tasks=Mock(return_value={'ok': True}), report_events=Mock(),
+                      claim_task=Mock(), run_miniprogram_tasks=Mock(return_value={'ok': True}))
+            result = ns['run_growth_tasks'](account(), gap=0)
+            with self.subTest(kind=kind):
+                self.assertFalse(result['ok'])
+                self.assertTrue(result.get('terminal'), result)
+                for name in ('accept_tasks', 'report_events', 'claim_task', 'run_miniprogram_tasks'):
+                    ns[name].assert_not_called()
+
+    def test_accept_terminal_stops_origin_and_family_boundaries_preserving_earnings(self):
+        for entry in ('run_growth_tasks', 'run_miniprogram_tasks'):
+            for status in (401, 403, 429, 11140, 14003, 6004, 6005, 10001):
+                ns = load_tasks()
+                rows = ([task('first_buddy', 'completed')] if entry == 'run_growth_tasks' else [])
+                if rows:
+                    rows[0]['task_type'] = 'auto'
+                rows += [task('Library_read' if entry == 'run_growth_tasks' else 'Sequential_Tasks_1', mp=False),
+                         task('skill_1' if entry == 'run_growth_tasks' else 'Sequential_Tasks_2', mp=True),
+                         task('Sequential_Tasks_3', 'accepted', mp=True)]
+                ns['discover_growth_tasks'] = Mock(return_value={'ok': True, 'tasks': rows, 'errors': []})
+                ns['fetch_growth_tasks'] = Mock(return_value=rows)
+                ns['claim_task'] = Mock(return_value={'ok': True, 'reward_verified': True, 'credit': 7})
+                ns['report_events'] = Mock()
+                ns['report_mp_events'] = Mock()
+                net = ns['_accounts'].urlopen
+                net.return_value = response({'code': status, 'msg': 'terminal accept'})
+                result = ns[entry](account(), gap=0, **({'tasks': rows} if entry == 'run_miniprogram_tasks' else {}))
+                with self.subTest(entry=entry, status=status):
+                    self.assertEqual(net.call_count, 1, 'continued origin writes')
+                    self.assertFalse(result['ok'])
+                    self.assertTrue(result.get('terminal'), result)
+                    self.assertEqual(result['earned_credit'], 7 if entry == 'run_growth_tasks' else 0)
+                    self.assertEqual(ns['claim_task'].call_count, 1 if entry == 'run_growth_tasks' else 0)
+                    ns['report_events'].assert_not_called()
+                    ns['report_mp_events'].assert_not_called()
+
+    def test_mp_terminal_result_reaches_outer_runner_without_balance_refresh(self):
+        ns = load_tasks()
+        ns['discover_growth_tasks'] = Mock(return_value={'ok': True,
+            'tasks': [task('Sequential_Tasks_1', 'completed', mp=True)], 'errors': []})
+        ns['_accounts'].urlopen.return_value = response({'code': 429, 'msg': 'stop now'})
+        acc = account()
+        result = ns['run_growth_tasks'](acc, gap=0)
+        self.assertFalse(result['ok'])
+        self.assertTrue(result.get('terminal'), result)
+        acc.fetch_credits.assert_not_called()
+
+    def test_post_accept_terminal_read_stops_other_origin(self):
+        ns = load_tasks()
+        rows = [task(mp=False), task('skill_1', mp=True), task('Sequential_Tasks_1', 'accepted', mp=True)]
+        ns['discover_growth_tasks'] = Mock(return_value={'ok': True, 'tasks': rows, 'errors': []})
+        ns['accept_tasks'] = Mock(return_value={'ok': True, 'accepted': ['Library_read'], 'failed': []})
+        ns['_accounts'].urlopen.side_effect = urllib.error.HTTPError(
+            'https://offline.invalid', 403, 'terminal', {}, io.BytesIO(b'{}'))
+        ns['report_events'] = Mock()
+        ns['report_mp_events'] = Mock()
+        result = ns['run_growth_tasks'](account(), gap=0)
+        self.assertFalse(result['ok'])
+        self.assertTrue(result.get('terminal'), result)
+        self.assertEqual(ns['accept_tasks'].call_count, 1)
+        ns['report_events'].assert_not_called()
+        ns['report_mp_events'].assert_not_called()
+
+
+    def test_terminal_at_report_claim_or_progress_blocks_remaining_account_writes(self):
+        for entry in ('run_growth_tasks', 'run_miniprogram_tasks'):
+            for stage in ('report', 'claim', 'claim_web', 'claim_readback', 'progress'):
+                for kind in ('http', 'business'):
+                    ns = load_tasks()
+                    code = 'Library_read' if entry == 'run_growth_tasks' else 'Sequential_Tasks_1'
+                    rows = [task(code, 'completed' if stage.startswith('claim') else 'accepted'),
+                            task('skill_1' if entry == 'run_growth_tasks' else 'Sequential_Tasks_2',
+                                 'completed', mp=True)]
+                    ns['discover_growth_tasks'] = Mock(return_value={'ok': True, 'tasks': rows, 'errors': []})
+                    failure = (urllib.error.HTTPError('https://offline.invalid', 429, 'terminal', {},
+                        io.BytesIO(b'{}')) if kind == 'http' else
+                        response({'code': 11140, 'msg': 'terminal diagnostic'}))
+                    sequence = []
+                    if stage == 'progress':
+                        sequence.append(response({'code': 0}))
+                    if stage == 'claim_web':
+                        sequence.append(urllib.error.HTTPError('https://offline.invalid', 400, 'fallback', {},
+                            io.BytesIO(b'{}')))
+                    if stage == 'claim_readback':
+                        sequence.append(response({'code': 0, 'data': {'credit': 0}}))
+                    sequence.append(failure)
+                    net = ns['_accounts'].urlopen
+                    net.side_effect = sequence + [response({'code': 0, 'data': {'credit': 9}})] * 10
+                    result = ns[entry](account(), gap=0,
+                        **({'tasks': rows} if entry == 'run_miniprogram_tasks' else {}))
+                    with self.subTest(entry=entry, stage=stage, kind=kind):
+                        self.assertEqual(net.call_count, len(sequence), 'continued writes after terminal stage')
+                        self.assertFalse(result['ok'], result)
+                        self.assertTrue(result.get('terminal'), result)
+                        self.assertEqual(result['earned_credit'], 0)
+                        self.assertIn('429' if kind == 'http' else '11140', str(result['logs']))
+
+
+class ProgressOutcomeTests(unittest.TestCase):
+    def test_progress_error_reaches_runner_and_real_api_dashboard(self):
+        import sys
+        import subprocess
+        from unittest.mock import patch
+        for auto in (False, True):
+            ns = load_tasks()
+            rows = [task('skill_1', 'completed'), task(status='accepted'),
+                    task('Sequential_Tasks_1', 'accepted', mp=True)]
+            if auto:
+                rows[1]['task_type'] = 'auto'
+            ns['discover_growth_tasks'] = Mock(return_value={'ok': True, 'tasks': rows, 'errors': []})
+            ns.update(build_event=Mock(return_value={}), report_events=Mock(return_value=True),
+                report_mp_events=Mock(return_value=True),
+                fetch_growth_tasks=Mock(side_effect=RuntimeError('progress evidence unavailable')),
+                claim_task=Mock(return_value={'ok': True, 'reward_verified': True, 'credit': 7}))
+            module = SimpleNamespace(run_growth_tasks=ns['run_growth_tasks'])
+            proxy = proxy_code(dict(POOL=SimpleNamespace(get=lambda _: account()),
+                invalidate_tasks_cache=Mock(), restriction_hold_remaining=lambda _: 0,
+                add_log_entry=Mock(), time=SimpleNamespace(sleep=lambda _: None)))
+            with patch.dict(sys.modules, {'wb_tasks': module}):
+                result = proxy['_route_tasks_run'](SimpleNamespace(_json_panel=lambda status, data: data),
+                    {'uid': 'offline'})
+            with self.subTest(auto=auto):
+                self.assertFalse(result['ok'], result)
+                self.assertIn('progress evidence unavailable', str(result['logs']))
+                self.assertEqual(result['credit_added'], 0 if auto else 7)
+                ns['report_mp_events'].assert_not_called()
+            source = (ROOT / 'dashboard.html').read_text()
+            helper = 'async function runGrowthTasks(btn, uidOverride){' + source.split(
+                'async function runGrowthTasks(btn, uidOverride){', 1)[1].split('\nasync function ', 1)[0]
+            js = "const assert=require('node:assert/strict'); const payload=" + json.dumps(result) + ";" + """
+                const messages=[]; const document={getElementById:()=>null};
+                const taskUidForRequest=()=> 'offline', postJSON=async()=>payload;
+                const loadAccounts=async()=>{},loadGrowthTasks=async()=>{},toast=(...a)=>messages.push(a);
+                """ + helper + """
+                (async()=>{assert.equal(await runGrowthTasks(null),false);
+                  assert.equal(messages.length,1);assert.equal(messages[0][1],'bad');
+                })().catch(e=>{console.error(e);process.exit(1)});
+                """
+            executed = subprocess.run(['node', '-e', js], capture_output=True, text=True)
+            self.assertEqual(executed.returncode, 0, executed.stderr)
+
+    def test_nonterminal_progress_read_failure_cannot_be_reported_as_runner_success(self):
+        ns = load_tasks()
+        ns['discover_growth_tasks'] = Mock(return_value={'ok': True,
+            'tasks': [task(status='accepted')], 'errors': []})
+        ns.update(build_event=Mock(return_value={}), report_events=Mock(return_value=True),
+            fetch_growth_tasks=Mock(side_effect=RuntimeError('progress unavailable')), claim_task=Mock())
+        result = ns['run_growth_tasks'](account(), gap=0)
+        self.assertFalse(result['ok'], result)
+        self.assertFalse(result.get('terminal', True))
+        self.assertEqual(result['errors'], ['progress unavailable'])
+        ns['claim_task'].assert_not_called()
+
+    def test_progress_failure_numeric_contract_is_preserved(self):
+        ns = load_tasks()
+        ns.update(build_event=Mock(return_value={}), report_events=Mock(return_value=True),
+                  fetch_growth_tasks=Mock(side_effect=RuntimeError('progress unavailable')))
+        outcome = ns['_progress_one'](account(), task(status='accepted'), [], 0)
+        self.assertEqual(outcome, 0)
+        self.assertEqual(7 + outcome, 7)
+        self.assertFalse(getattr(outcome, 'ok', True))
+        self.assertIn('progress unavailable', getattr(outcome, 'error', ''))
 
 
 class RunnerTests(unittest.TestCase):
