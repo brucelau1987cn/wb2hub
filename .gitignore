@@ -14,3 +14,4 @@ __pycache__/
 *.tar.gz
 dist/
 backups/
+test-results/
