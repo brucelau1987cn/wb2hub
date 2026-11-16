@@ -1,0 +1,16 @@
+# Credential-free test image. No production volumes or Docker socket required.
+ARG RUNTIME_IMAGE=wb2hub:ci
+FROM ${RUNTIME_IMAGE} AS wb2hub-runtime
+FROM python:3.11-alpine@sha256:7fbad8e4652eae0186429a6f26cf5b23e27e8c6fd7ac4d0cfd7a6988cdeea1e1 AS test-deps
+RUN apk add --no-cache nodejs ca-certificates
+WORKDIR /workspace
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+FROM test-deps AS tests
+COPY . ./
+# Real helper for the bridge regression suites, built from source by Dockerfile.
+COPY --from=wb2hub-runtime /app/bin/wb-tls-bridge ./bin/wb-tls-bridge
+ENV PYTHONDONTWRITEBYTECODE=1 TMPDIR=/results/tmp
+RUN mkdir -p /results/tmp && chmod 0755 ./bin/wb-tls-bridge
+CMD ["python", "scripts/run_upstream_tests.py", "--logs", "/results/upstream"]

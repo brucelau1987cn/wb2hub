@@ -9,4 +9,5 @@ __pycache__
 **/__pycache__
 *.log
 *.tar*
+test-results
 backups
