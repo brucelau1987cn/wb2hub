@@ -693,6 +693,11 @@ class TLSFingerprintTests(unittest.TestCase):
                 "last_fallback_reason",
                 "last_fallback_at",
                 "auto_retry_available",
+                "retry_attempts_used",
+                "retry_attempts_remaining",
+                "retry_wait_seconds",
+                "retry_exhausted",
+                "last_failure",
                 "bridge_generation",
                 "keepalive_enabled",
             })
