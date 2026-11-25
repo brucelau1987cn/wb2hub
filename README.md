@@ -18,6 +18,26 @@ cp .env.example .env
 docker compose up -d --build
 ```
 
+### 下载正式版安装（无需 Git）
+
+打开 [最新正式版下载页](https://github.com/brucelau1987cn/wb2hub/releases/latest)，选择 `wb2hub-vX.Y.Z-source.tar.gz` 和同版 `SHA256SUMS`。这是 **Docker 源码构建包**，不是 Windows 安装器或预构建镜像；需要 Docker Engine、Compose v2 及构建时联网。
+
+以下固定为 v0.3.1，新装时在一个全新的目录执行；不要解压覆盖已有账号目录：
+
+```bash
+curl -fLO https://github.com/brucelau1987cn/wb2hub/releases/download/v0.3.1/wb2hub-v0.3.1-source.tar.gz
+curl -fLO https://github.com/brucelau1987cn/wb2hub/releases/download/v0.3.1/SHA256SUMS
+sha256sum -c SHA256SUMS
+tar -xzf wb2hub-v0.3.1-source.tar.gz
+cd wb2hub-v0.3.1
+cp .env.example .env
+# 编辑 .env，设置独立且足够强的 API_KEY，再启动：
+docker compose up -d --build
+docker compose ps
+```
+
+以后下载最新正式版请使用上面的 `/releases/latest` 页面；不要使用旧版本详情页或旧附件链接。仓库默认分支代码可能领先 Release，只有正式发布后下载包才会更新。应用面板的版本检查不等于自动部署，已有实例升级仍需备份、保留自己的端口/凭据/挂载并受控切换。
+
 ### Compose 文件入口
 
 仓库同时提供 [`compose.yml`](compose.yml) 和 [`docker-compose.yml`](docker-compose.yml)，内容保持一致，CI 自动检查两者一致性及 Compose 配置有效性。`docker compose` 默认优先读取 `compose.yml`；喜欢上游文件名时可明确使用：
