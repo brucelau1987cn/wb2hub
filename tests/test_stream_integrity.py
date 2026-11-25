@@ -214,7 +214,7 @@ class StreamIntegrityTests(unittest.TestCase):
                             and isinstance(value, ast.Constant) and isinstance(value.value, str)):
                         version_values.append(value.value)
         self.assertEqual(len(version_values), 2)
-        self.assertTrue(all("0.3.0" in value for value in version_values), version_values)
+        self.assertTrue(all("0.3.1" in value for value in version_values), version_values)
 
     def test_legacy_function_call_argument_continuations_are_retained(self):
         rows = [chunk({"function_call": {"name": "run", "arguments": "{"}}),
